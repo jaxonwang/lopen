@@ -68,6 +68,34 @@ class TestBuildRemoteConfig(unittest.TestCase):
             with self.assertRaises(cli.SshHostError):
                 cli.build_remote_config(bad)
 
+    def test_jump_emits_lopen_jump(self):
+        text = cli.build_remote_config("mydev", jump="A,B")
+        self.assertIn("LOPEN_JUMP=A,B\n", text)
+
+    def test_jump_single_host(self):
+        text = cli.build_remote_config("alice@mydev", jump="jump.example.com")
+        self.assertIn("LOPEN_JUMP=jump.example.com\n", text)
+
+    def test_jump_user_at_host_element(self):
+        text = cli.build_remote_config("mydev", jump="bob@A,B")
+        self.assertIn("LOPEN_JUMP=bob@A,B\n", text)
+
+    def test_no_jump_when_absent(self):
+        text = cli.build_remote_config("mydev")
+        self.assertNotIn("LOPEN_JUMP", text)
+
+    def test_jump_rejects_injection(self):
+        # Newlines / bad charset in --via must not smuggle extra config lines.
+        for bad in ("A\nLOPEN_HOST=evil", "A,-oProxyCommand=x", "A;rm", "A B",
+                    "A\r\nX=1", "-A,B"):
+            with self.assertRaises(cli.SshHostError):
+                cli.build_remote_config("mydev", jump=bad)
+
+    def test_jump_normalizes_whitespace_around_elements(self):
+        # Each element is stripped by validate_ssh_host.
+        text = cli.build_remote_config("mydev", jump=" A , B ")
+        self.assertIn("LOPEN_JUMP=A,B\n", text)
+
 
 class TestValidateSshHost(unittest.TestCase):
     def test_accepts_alias_and_user_at_host(self):
@@ -89,6 +117,21 @@ class TestValidateSshHost(unittest.TestCase):
         for bad in ("a b", "a;b", "a$b", "a`b`", "", "   "):
             with self.assertRaises(cli.SshHostError):
                 cli.validate_ssh_host(bad)
+
+
+class TestValidateJump(unittest.TestCase):
+    def test_single_and_chain(self):
+        self.assertEqual(cli.validate_jump("A"), "A")
+        self.assertEqual(cli.validate_jump("A,B"), "A,B")
+        self.assertEqual(cli.validate_jump("user@A,B"), "user@A,B")
+
+    def test_strips_element_whitespace(self):
+        self.assertEqual(cli.validate_jump(" A , B "), "A,B")
+
+    def test_rejects_bad_elements(self):
+        for bad in ("A,-B", "-A", "A B", "A;rm", "A\nB", "A,,B", ""):
+            with self.assertRaises(cli.SshHostError):
+                cli.validate_jump(bad)
 
 
 class TestParseHostsFile(unittest.TestCase):

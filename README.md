@@ -43,8 +43,8 @@ lopen report.pdf                # opens on your Mac
 
 - **Terminal (the core requirement):** an OSC 52-capable terminal on your Mac (iTerm2, WezTerm, kitty, Alacritty, …). If your terminal can copy to the clipboard over OSC 52, lopen works. Terminal.app is NOT supported — see [Terminal requirements](#terminal-requirements).
 - **Local:** macOS, with the built-in `python3`, `pbpaste`, `open`, `scp`, `ssh` (all present by default). No third-party packages — the daemon and CLI are Python 3 standard library only. Homebrew is optional (the script installer needs no admin either).
-- **Remote:** any Linux/Unix host with `bash`, `base64`, and `coreutils` (`realpath`/`stat`). No runtime to install — `lopen` is a single self-contained bash script.
-- **Connectivity:** passwordless ssh from your Mac to the remote host (the daemon uses `BatchMode=yes` for both the file `scp` and the blocking back-channel).
+- **Remote:** any Linux/Unix host with `bash`, `base64`, and `coreutils` (`realpath`/`stat`). Inline delivery (see [Recursive ssh](#recursive-ssh-multi-hop)) additionally uses `gzip` (and `tar` for directories); if missing, lopen falls back to scp. No runtime to install — `lopen` is a single self-contained bash script.
+- **Connectivity:** passwordless ssh from your Mac to the remote host for the scp fetch and the blocking back-channel (the daemon uses `BatchMode=yes`). **Inline mode needs no such connectivity** — small files/dirs ride the clipboard through any number of ssh hops. For multi-hop scp, see [Recursive ssh (multi-hop)](#recursive-ssh-multi-hop).
 
 ## Architecture
 
@@ -138,6 +138,61 @@ configurable via `LOPEN_WAIT_TIMEOUT` (env or `~/.lopen/config`). Pass
 The back-channel works by the daemon ssh-ing back to the remote and atomically
 dropping `~/.lopen/signals/<nonce>`; the blocked `lopen` polls for that file.
 
+## Recursive ssh (multi-hop)
+
+The OSC 52 clipboard write rides your TTY through **every** ssh hop, so `lopen`
+on a deeply-nested host (Mac → A → B → C) still reaches your Mac's clipboard.
+The tricky part is delivering the file. lopen offers two modes:
+
+### Inline mode — works at any depth, zero config
+
+For **small** files (and, on request, directories) lopen embeds the file
+**content** directly in the LOPEN1 message: the bytes are gzip'd (a single file)
+or tar-gzip'd (a directory), base64-encoded, and carried inside the JSON. The
+daemon materializes the copy locally with **no scp and no ssh back** — so it
+works through **any number of ssh hops**, even for hosts your Mac cannot reach
+at all.
+
+```sh
+# On host C (reached via Mac → A → B → C), no setup on C required:
+lopen notes.txt            # small file: auto-inlined, opens on your Mac
+lopen --inline build.log   # force inline regardless of size
+lopen --inline ./logs      # force inline for a directory (tar-gzip'd)
+```
+
+- **Auto-select:** files at or below `LOPEN_INLINE_MAX` (default **256 KiB**)
+  are inlined automatically; larger files and directories default to scp. Use
+  `--inline` to force it (files → `gz`, dirs → `tgz`) or `--scp` to disable it.
+- **Size cap:** the content travels as base64 **on the clipboard** (and is
+  base64'd again inside the OSC 52 escape), so keep it small. The 256 KiB cap
+  guards against oversized clipboard writes; raise it with `LOPEN_INLINE_MAX`
+  (env or `~/.lopen/config`) at your own risk.
+- **No network needed** for the fetch — inline requires only `gzip` (and `tar`
+  for directories) on the remote; if either is missing lopen warns and falls
+  back to scp mode.
+
+Extracted directories are unpacked with a **path-traversal-safe** extractor:
+archive members that would escape the temp dir (via `..`, absolute paths, or
+escaping symlinks) are refused.
+
+### ProxyJump mode — large files/dirs over a declared chain
+
+For **large** files/dirs the daemon scp's the path back. If your Mac reaches
+the target only via jump hosts, declare the chain at setup time:
+
+```sh
+lopen setup --via A,B userC@C     # bakes LOPEN_JUMP=A,B into C's ~/.lopen/config
+```
+
+The remote then advertises the chain in each message, and the daemon uses
+`scp -J A,B` / `ssh -J A,B` for both the fetch and the wait-mode signal-back.
+`setup` itself also tunnels its provisioning ssh/scp through `--via`, so it can
+reach a host that is only reachable via the chain.
+
+**Requirement:** ProxyJump needs passwordless ssh **along each hop** — your Mac
+to the first jump host, and each jump host to the next. Inline mode has no such
+requirement (nothing is fetched).
+
 ### Managing the daemon from your Mac
 
 ```sh
@@ -224,6 +279,11 @@ lines only, never sourced) or env:
 | `LOPEN_HOST` | `hostname -f` | Host the daemon scp's back from |
 | `LOPEN_USER` | `$USER` | User for the scp-back |
 | `LOPEN_WAIT_TIMEOUT` | `45` | Seconds to wait for the local open |
+| `LOPEN_JUMP` | (none) | Comma-separated ssh jump hosts (ProxyJump) for the daemon's scp/ssh-back, e.g. `A,B`. Set by `lopen setup --via A,B`. |
+| `LOPEN_INLINE_MAX` | `262144` | Max file size (bytes) for automatic inline delivery (256 KiB) |
+
+The remote `lopen` also accepts `--inline` (force inline delivery) and `--scp`
+(force scp delivery) per invocation; see "Recursive ssh (multi-hop)" above.
 
 ## Security note
 

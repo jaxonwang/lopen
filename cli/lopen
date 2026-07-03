@@ -139,6 +139,16 @@ class SshHostError(ValueError):
 # ssh-host can never inject extra KEY=value lines into the remote config file.
 _SSH_HOST_RE = re.compile(r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+$")
 
+# Jump-chain element: same conservative user@host charset, but the leading
+# character of BOTH the user and host component must NOT be a dash. A jump host
+# becomes an `ssh -J <chain>` operand, so a leading-dash element like
+# "-oProxyCommand=..." would be option injection into ssh/scp. (validate_ssh_host
+# is intentionally left permissive for backward compatibility; jump is new and
+# stricter.)
+_JUMP_ELEM_RE = re.compile(
+    r"^(?:[A-Za-z0-9._][A-Za-z0-9._-]*@)?[A-Za-z0-9._][A-Za-z0-9._-]*$"
+)
+
 
 def validate_ssh_host(ssh_host):
     """Return the stripped ssh-host if safe, else raise SshHostError.
@@ -159,6 +169,32 @@ def validate_ssh_host(ssh_host):
     return s
 
 
+def validate_jump(via):
+    """Validate a comma-separated jump chain, returning the normalized string.
+
+    Each element is stripped, then must pass _JUMP_ELEM_RE: the same conservative
+    user@host charset as an ssh-host, but with NO leading dash on either
+    component (option-injection guard) and no newlines/CR (so it can never inject
+    extra KEY=value lines when written as LOPEN_JUMP). Empty elements are
+    rejected. Raises SshHostError on any bad element.
+
+    Returns the re-joined "A,B" string (with each element stripped).
+    """
+    parts = []
+    for raw in via.split(","):
+        el = raw.strip()
+        if not el:
+            raise SshHostError("empty jump host in chain: %r" % via)
+        if any(c in el for c in "\r\n"):
+            raise SshHostError("jump host must not contain newlines")
+        if not _JUMP_ELEM_RE.match(el):
+            raise SshHostError("jump host has invalid characters: %r" % el)
+        parts.append(el)
+    if not parts:
+        raise SshHostError("empty jump chain")
+    return ",".join(parts)
+
+
 def split_ssh_host(ssh_host):
     """Split an ssh target into (user, host).
 
@@ -176,7 +212,7 @@ def split_ssh_host(ssh_host):
     return (None, ssh_host)
 
 
-def build_remote_config(ssh_host, local_user=None, wait_timeout=None):
+def build_remote_config(ssh_host, local_user=None, wait_timeout=None, jump=None):
     """Build the contents of the remote ~/.lopen/config file.
 
     LOPEN_HOST = the host portion the daemon will scp back to. LOPEN_USER is
@@ -184,8 +220,12 @@ def build_remote_config(ssh_host, local_user=None, wait_timeout=None):
     remote's own $USER (we can't know the remote $USER here, so we always write
     LOPEN_USER when the ssh target carried one - harmless and explicit).
 
-    Validates ssh_host first (raises SshHostError) so a malicious/typo'd value
-    (e.g. containing a newline) cannot inject extra lines into the remote config.
+    LOPEN_JUMP = the comma-separated ProxyJump chain (from `--via`), written only
+    when given. The daemon includes it in scp/ssh as `-J A,B`.
+
+    Validates ssh_host (and jump) first (raises SshHostError) so a malicious or
+    typo'd value (e.g. containing a newline) cannot inject extra lines into the
+    remote config file.
     """
     ssh_host = validate_ssh_host(ssh_host)
     user, host = split_ssh_host(ssh_host)
@@ -197,6 +237,9 @@ def build_remote_config(ssh_host, local_user=None, wait_timeout=None):
         lines.append("LOPEN_USER=%s" % user)
     if wait_timeout is not None:
         lines.append("LOPEN_WAIT_TIMEOUT=%s" % int(wait_timeout))
+    if jump:
+        # Injection-sensitive: validate_jump rejects newlines and bad charsets.
+        lines.append("LOPEN_JUMP=%s" % validate_jump(jump))
     return "\n".join(lines) + "\n"
 
 
@@ -498,6 +541,19 @@ def cmd_setup(args):
     ssh_opts = args.ssh_opts.split() if args.ssh_opts else []
     user, host = split_ssh_host(ssh_host)
 
+    # Optional ProxyJump chain (--via A,B). Validated up front (config-injection
+    # safe) and threaded into BOTH the setup ssh/scp (so we can reach a host that
+    # is only reachable via the chain) and the remote config (LOPEN_JUMP).
+    jump = None
+    if args.via:
+        try:
+            jump = validate_jump(args.via)
+        except SshHostError as exc:
+            print("error: --via %s" % exc, file=sys.stderr)
+            return 1
+        # -J goes in the ssh/scp OPTIONS, before the -- terminator.
+        ssh_opts = ["-J", jump] + ssh_opts
+
     remote_lopen = find_remote_lopen()
     if not remote_lopen:
         print("error: cannot locate the remote lopen script to ship "
@@ -505,7 +561,9 @@ def cmd_setup(args):
         return 1
 
     print("Setting up remote host: %s" % ssh_host)
-    print("  (user=%s host=%s remote-dir=%s)" % (user or "$USER", host, remote_dir))
+    print("  (user=%s host=%s remote-dir=%s%s)"
+          % (user or "$USER", host, remote_dir,
+             " via=%s" % jump if jump else ""))
 
     def ssh(remote_cmd, **kw):
         return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
@@ -533,7 +591,8 @@ def cmd_setup(args):
     print("%s shipped lopen -> %s:%s" % (CHECK, ssh_host, remote_target))
 
     # 2. Write remote ~/.lopen/config (never sourced remotely; KEY=value only).
-    config_text = build_remote_config(ssh_host, wait_timeout=args.wait_timeout)
+    config_text = build_remote_config(ssh_host, wait_timeout=args.wait_timeout,
+                                       jump=jump)
     wr = ssh("mkdir -p ~/.lopen && cat > ~/.lopen/config",
              input=config_text)
     if wr.returncode != 0:
@@ -680,6 +739,11 @@ def build_parser():
     s.add_argument("--remote-dir", default="~/bin",
                    help="Remote dir to install lopen into (default: ~/bin).")
     s.add_argument("--ssh-opts", default="", help="Extra ssh/scp options.")
+    s.add_argument("--via", default=None,
+                   help="Comma-separated ssh jump hosts (ProxyJump), e.g. "
+                        "--via A,B. Baked into the remote config as LOPEN_JUMP "
+                        "and used for setup's own ssh/scp. Requires passwordless "
+                        "ssh along each hop.")
     s.add_argument("--wait-timeout", type=int, default=None,
                    help="Set LOPEN_WAIT_TIMEOUT in the remote config.")
     s.set_defaults(func=cmd_setup)

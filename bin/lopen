@@ -4,15 +4,26 @@
 #
 # Runs on a remote Linux host (over ssh). It gathers metadata about the target
 # path and emits an OSC 52 escape sequence that sets your LOCAL Mac clipboard to
-# a magic-prefixed LOPEN1 message. A local daemon (lopend) sees that message,
-# scp's the file down, and runs macOS `open` on it.
+# a magic-prefixed LOPEN1 message. A local daemon (lopend) sees that message and
+# either (a) materializes an INLINE copy carried inside the message, or (b) scp's
+# the file down, then runs macOS `open` on it.
+#
+# Two delivery modes (see README "Recursive ssh"):
+#   * INLINE (default for small files): the file CONTENT is gzip'd/tar-gzip'd,
+#     base64'd, and embedded directly in the LOPEN1 JSON. The daemon needs NO
+#     scp/ssh back to us, so this works through UNLIMITED ssh hops and even for
+#     hosts your Mac cannot reach at all. Capped by LOPEN_INLINE_MAX (256 KiB).
+#   * SCP (large files/dirs): the daemon scp's the path back. If your Mac reaches
+#     this host only via jump hosts, set LOPEN_JUMP=A,B (baked in by
+#     `lopen setup --via A,B`) so the daemon uses `scp -J A,B` / `ssh -J A,B`.
 #
 # By default lopen then BLOCKS until the local daemon signals back (via a small
 # file dropped over ssh into ~/.lopen/signals/<nonce>), so the command exits
 # only once the file has actually opened on your Mac. Use --no-wait to fire and
 # forget.
 #
-# Protocol: LOPEN1 (see README.md). Zero deps beyond coreutils + base64.
+# Protocol: LOPEN1 (see README.md). Zero deps beyond coreutils + base64 (inline
+# mode additionally needs gzip and, for directories, tar).
 #
 set -euo pipefail
 
@@ -24,10 +35,13 @@ SIGNAL_DIR="$HOME/.lopen/signals"
 # Defaults (overridable via ~/.lopen/config or environment).
 DEFAULT_WAIT_TIMEOUT=45
 WAIT_POLL_INTERVAL=0.3
+# Inline delivery size cap: files at or below this (in bytes) ride the clipboard
+# inline; larger files (and directories, by default) use scp. 256 KiB.
+DEFAULT_INLINE_MAX=262144
 
 usage() {
 	cat <<EOF
-Usage: $PROG [--no-wait] <path>
+Usage: $PROG [--no-wait] [--inline|--scp] <path>
        $PROG --print <path>
        $PROG -h | --help
 
@@ -39,16 +53,27 @@ Arguments:
 Options:
   --no-wait       Fire and forget: emit the OSC 52 sequence and exit immediately
                   without waiting for the local daemon to confirm the open.
+  --inline        Force INLINE delivery: embed the (gzip'd file / tar-gzip'd dir)
+                  content in the message, regardless of size. Works through any
+                  number of ssh hops with no scp needed.
+  --scp           Force SCP delivery: never inline. The daemon scp's the path.
   --print         Print the raw LOPEN1 clipboard string to stdout instead of
                   emitting the OSC 52 terminal sequence. Never blocks. Useful
                   for testing (pipe it into pbcopy).
   -h, --help      Show this help.
+
+By default lopen picks inline for small files (size <= LOPEN_INLINE_MAX) and
+scp otherwise (and for directories).
 
 Config (~/.lopen/config, KEY=value lines):
   LOPEN_HOST          Host the local daemon should scp back from (defaults to
                       \`hostname -f\`). Set by \`lopen setup\` on your Mac.
   LOPEN_USER          User for the scp-back (defaults to \$USER).
   LOPEN_WAIT_TIMEOUT  Seconds to wait for the local open (default $DEFAULT_WAIT_TIMEOUT).
+  LOPEN_JUMP          Comma-separated ssh jump hosts (e.g. A,B) for the daemon's
+                      scp/ssh back (ProxyJump). Set by \`lopen setup --via A,B\`.
+  LOPEN_INLINE_MAX    Max file size (bytes) for automatic inline delivery
+                      (default $DEFAULT_INLINE_MAX).
 
 Requires the local 'lopend' daemon running on your Mac and a terminal that
 supports OSC 52 clipboard writes (e.g. iTerm2 with clipboard access enabled).
@@ -129,10 +154,28 @@ nonce_from_message() {
 	printf '%s' "$nonce"
 }
 
+# Read a numeric config/env value with fallback. Mirrors how LOPEN_WAIT_TIMEOUT
+# is validated: garbage (non-digits / empty) falls back to the default. Env wins
+# over config. Usage: numeric_config KEY DEFAULT
+numeric_config() {
+	local key=$1 default=$2 value env_value cfg_value
+	cfg_value=$(config_get "$key")
+	# Indirect-expand the env var of the same name (may be unset). Bash native
+	# indirection avoids eval; callers only ever pass hardcoded literal keys.
+	env_value=${!key:-}
+	value=${env_value:-${cfg_value:-$default}}
+	case "$value" in
+	'' | *[!0-9]*) value=$default ;;
+	esac
+	printf '%s' "$value"
+}
+
 # --- Build the LOPEN1 clipboard string S for a given path ---------------------
+# $3 is the delivery mode preference: "auto" (default), "inline", or "scp".
 build_message() {
 	local target=$1
 	local want_wait=$2 # "true" or "false" -> emits the "wait" JSON field
+	local mode_pref=${3:-auto}
 
 	if [ ! -e "$target" ]; then
 		err "path does not exist: $target"
@@ -182,12 +225,87 @@ build_message() {
 
 	# host/user come from config if set (so the daemon knows the scp-reachable
 	# identity, which may differ from the box's own hostname), else fall back.
-	local host user nonce cfg_host cfg_user
+	# They are still included for inline delivery because the wait-mode signal
+	# back-channel ssh's to user@host regardless of how the file was delivered.
+	local host user nonce cfg_host cfg_user cfg_jump
 	cfg_host=$(config_get LOPEN_HOST)
 	cfg_user=$(config_get LOPEN_USER)
+	cfg_jump=$(config_get LOPEN_JUMP)
 	host=${cfg_host:-$(hostname -f 2>/dev/null || hostname)}
 	user=${cfg_user:-${USER:-$(id -un)}}
 	nonce=$(gen_nonce)
+
+	# --- Decide delivery mode ------------------------------------------------
+	# auto: inline iff (NOT is_dir) AND (size <= LOPEN_INLINE_MAX). Directories
+	# default to scp. --inline forces inline (files->gz, dirs->tgz); --scp forces
+	# scp. If inline is chosen but gzip/tar are missing, we warn and fall back to
+	# scp (inline is a convenience, not a hard requirement).
+	local inline_max
+	inline_max=$(numeric_config LOPEN_INLINE_MAX "$DEFAULT_INLINE_MAX")
+
+	local use_inline=false
+	case "$mode_pref" in
+	inline)
+		use_inline=true
+		;;
+	scp)
+		use_inline=false
+		;;
+	*) # auto
+		if [ "$is_dir" != true ] && [ "$size" != null ] \
+			&& [ "$size" -le "$inline_max" ] 2>/dev/null; then
+			use_inline=true
+		fi
+		;;
+	esac
+
+	# Inline needs gzip (always) and tar (for directories). If unavailable, warn
+	# and fall back to scp mode.
+	if [ "$use_inline" = true ]; then
+		if ! command -v gzip >/dev/null 2>&1; then
+			err "gzip not found; falling back to scp delivery."
+			use_inline=false
+		elif [ "$is_dir" = true ] && ! command -v tar >/dev/null 2>&1; then
+			err "tar not found; falling back to scp delivery for directory."
+			use_inline=false
+		fi
+	fi
+
+	# Build the inline enc/content fields, or the jump field for scp mode.
+	local extra_fields=""
+	if [ "$use_inline" = true ]; then
+		local enc content
+		if [ "$is_dir" = true ]; then
+			enc=tgz
+			# tar the dir by basename from its parent, gzip, base64. Using -C
+			# <parent> <base> keeps the archive rooted at the dir's own name.
+			local parent base
+			parent=$(dirname -- "$abspath")
+			base=$(basename -- "$abspath")
+			content=$(tar -czf - -C "$parent" -- "$base" 2>/dev/null | b64_nowrap) || {
+				err "failed to create inline tgz; falling back to scp."
+				content=""
+			}
+		else
+			enc=gz
+			content=$(gzip -c -- "$abspath" 2>/dev/null | b64_nowrap) || {
+				err "failed to gzip inline content; falling back to scp."
+				content=""
+			}
+		fi
+		if [ -n "$content" ]; then
+			extra_fields=$(printf ',"enc":"%s","content":"%s"' \
+				"$enc" "$(json_escape "$content")")
+		else
+			use_inline=false
+		fi
+	fi
+
+	# scp mode (or inline fallback): include the jump chain if configured so the
+	# daemon can reach us via ProxyJump.
+	if [ "$use_inline" != true ] && [ -n "$cfg_jump" ]; then
+		extra_fields=$(printf ',"jump":"%s"' "$(json_escape "$cfg_jump")")
+	fi
 
 	# Assemble compact JSON (no spaces). Non-numeric fields are JSON-escaped.
 	# The optional "wait" field is emitted only when blocking.
@@ -197,7 +315,7 @@ build_message() {
 	fi
 
 	local json
-	json=$(printf '{"v":1,"host":"%s","user":"%s","path":"%s","name":"%s","is_dir":%s,"size":%s,"mtime":%s,"nonce":"%s"%s}' \
+	json=$(printf '{"v":1,"host":"%s","user":"%s","path":"%s","name":"%s","is_dir":%s,"size":%s,"mtime":%s,"nonce":"%s"%s%s}' \
 		"$(json_escape "$host")" \
 		"$(json_escape "$user")" \
 		"$(json_escape "$abspath")" \
@@ -206,7 +324,8 @@ build_message() {
 		"$size" \
 		"$mtime" \
 		"$(json_escape "$nonce")" \
-		"$wait_field")
+		"$wait_field" \
+		"$extra_fields")
 
 	# S = "LOPEN1:" + base64(JSON), no line wrapping.
 	printf 'LOPEN1:%s' "$(printf '%s' "$json" | b64_nowrap)"
@@ -326,6 +445,7 @@ wait_for_signal() {
 main() {
 	local mode=emit
 	local do_wait=true
+	local delivery=auto # auto | inline | scp
 	local target=""
 
 	while [ $# -gt 0 ]; do
@@ -340,6 +460,14 @@ main() {
 			;;
 		--no-wait)
 			do_wait=false
+			shift
+			;;
+		--inline)
+			delivery=inline
+			shift
+			;;
+		--scp)
+			delivery=scp
 			shift
 			;;
 		--)
@@ -371,7 +499,7 @@ main() {
 	# --print never blocks and never advertises wait.
 	if [ "$mode" = print ]; then
 		local s
-		s=$(build_message "$target" false) || return 1
+		s=$(build_message "$target" false "$delivery") || return 1
 		printf '%s\n' "$s"
 		return 0
 	fi
@@ -382,7 +510,7 @@ main() {
 	fi
 
 	local s
-	s=$(build_message "$target" "$do_wait") || return 1
+	s=$(build_message "$target" "$do_wait" "$delivery") || return 1
 	emit_osc52 "$s"
 
 	if [ "$do_wait" = true ]; then
