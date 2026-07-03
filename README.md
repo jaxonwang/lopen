@@ -15,6 +15,25 @@ file down, and runs macOS `open` on the local copy. By default the remote
 command then **blocks** until the local open finishes (a small back-channel over
 ssh), so `lopen` behaves like a normal blocking command.
 
+## Quickstart
+
+```sh
+# On your Mac, from the repo root:
+./install/install-local.sh
+lopen setup <ssh-host>          # e.g. lopen setup mydev
+lopen doctor                    # confirm everything is ✓
+
+# Then from an ssh session on that host:
+lopen report.pdf                # opens on your Mac
+```
+
+## Requirements
+
+- **Local:** macOS, with the built-in `python3`, `pbpaste`, `open`, `scp`, `ssh` (all present by default). No third-party packages — the daemon and CLI are Python 3 standard library only.
+- **Remote:** any Linux/Unix host with `bash`, `base64`, and `coreutils` (`realpath`/`stat`). No runtime to install — `lopen` is a single self-contained bash script.
+- **Connectivity:** passwordless ssh from your Mac to the remote host (the daemon uses `BatchMode=yes` for both the file `scp` and the blocking back-channel).
+- **Terminal:** an OSC 52-capable terminal on your Mac (iTerm2, WezTerm, kitty, Alacritty, …). Terminal.app is NOT supported — see [Terminal requirements](#terminal-requirements).
+
 ## Architecture
 
 ```
@@ -210,3 +229,7 @@ dedup, scp/signal arg building, config/hosts helpers):
 ```sh
 python3 -m unittest
 ```
+
+## License
+
+See [LICENSE](LICENSE).
