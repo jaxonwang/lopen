@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""lopend - local macOS daemon for the lopen tool.
+
+Polls the Mac clipboard (via `pbpaste`). When it sees a magic "LOPEN1:" message
+(produced by the remote `lopen` script), it decodes the embedded JSON, scp's the
+referenced file/dir from the remote host into a per-invocation temp dir, and runs
+macOS `open` on the local copy.
+
+Python 3 standard library only - no third-party dependencies.
+
+The pure-function layer (parse_message, build_scp_args, build_open_args) is
+importable and unit-testable without touching the clipboard.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import datetime as _dt
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+MAGIC_PREFIX = "LOPEN1:"
+DEFAULT_INTERVAL = 0.5
+DEFAULT_HOME = os.path.expanduser("~/.lopen")
+
+# The clipboard is an untrusted trust boundary: anything that can write to it
+# (including any host you ssh into) can hand us a LOPEN1 message. We therefore
+# constrain the fields that end up as scp/ssh operands. host/user must NOT begin
+# with '-' -- scp/ssh treat leading-dash operands as options, so a host like
+# "-oProxyCommand=..." would be option injection. The first character must be
+# alphanumeric/dot/underscore (no leading dash), and the remainder may also
+# include '-'. No '@' or ':' anywhere.
+_USER_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
+
+# Nonce is used in a fixed remote shell command (the signal-back write), so it
+# must be strictly alphanumeric to be safe to interpolate.
+_NONCE_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+# --------------------------------------------------------------------------- #
+# Pure functions (unit-testable, no side effects)
+# --------------------------------------------------------------------------- #
+class MessageError(ValueError):
+    """Raised when a clipboard value is not a valid LOPEN1 message."""
+
+
+def parse_message(clipboard_value):
+    """Parse a clipboard string into a validated LOPEN1 message dict.
+
+    Returns the parsed/validated dict, or raises MessageError if the string is
+    not a well-formed LOPEN1 message.
+
+    The clipboard string S has the form:  "LOPEN1:" + base64(compact-JSON)
+    """
+    if not isinstance(clipboard_value, str):
+        raise MessageError("clipboard value is not text")
+
+    value = clipboard_value.strip()
+    if not value.startswith(MAGIC_PREFIX):
+        raise MessageError("not a LOPEN1 message")
+
+    # Strip ALL whitespace from the base64 body, not just the ends: clipboard
+    # managers and terminals occasionally inject line breaks or spaces. We then
+    # decode leniently (validate=False) so a mildly-mangled-but-recoverable
+    # payload still works; the strict JSON/version/field checks below remain the
+    # real gate.
+    b64 = "".join(value[len(MAGIC_PREFIX):].split())
+    try:
+        raw = base64.b64decode(b64)
+    except (binascii.Error, ValueError) as exc:
+        raise MessageError("invalid base64 payload: %s" % exc)
+
+    try:
+        msg = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MessageError("invalid JSON payload: %s" % exc)
+
+    if not isinstance(msg, dict):
+        raise MessageError("payload is not a JSON object")
+
+    if msg.get("v") != 1:
+        raise MessageError("unsupported protocol version: %r" % msg.get("v"))
+
+    # Required string fields.
+    for field in ("host", "user", "path", "name", "nonce"):
+        if not isinstance(msg.get(field), str) or not msg.get(field):
+            raise MessageError("missing or invalid field: %s" % field)
+
+    if not isinstance(msg.get("is_dir"), bool):
+        raise MessageError("missing or invalid field: is_dir")
+
+    # Harden the fields that become scp/ssh operands or local filesystem paths.
+    if not _USER_RE.match(msg["user"]):
+        raise MessageError("invalid user: %r" % msg["user"])
+    if not _HOST_RE.match(msg["host"]):
+        raise MessageError("invalid host: %r" % msg["host"])
+    # path must be absolute so we never resolve it against some local cwd.
+    if not msg["path"].startswith("/"):
+        raise MessageError("path is not absolute: %r" % msg["path"])
+
+    # Optional "wait" field: if present it must be a bool. Missing -> False
+    # (legacy non-blocking behaviour). We normalize it onto the dict so callers
+    # can always read msg["wait"].
+    if "wait" in msg:
+        if not isinstance(msg["wait"], bool):
+            raise MessageError("invalid wait field: %r" % msg["wait"])
+    else:
+        msg["wait"] = False
+
+    return msg
+
+
+def message_id(msg):
+    """Stable dedup id for a parsed message.
+
+    Uses the nonce (which the remote regenerates every invocation) combined with
+    the path, so re-opening the same file always produces a new id.
+    """
+    return "%s\x00%s" % (msg.get("nonce", ""), msg.get("path", ""))
+
+
+def build_scp_args(msg, dest_dir, ssh_opts=None):
+    """Build the argv list for the scp fetch.
+
+    CRITICAL quoting note:
+      scp runs the remote path through a shell on the remote sshd. So a path with
+      spaces / special chars must be shell-quoted for that remote shell, then the
+      whole "user@host:quoted-remote-path" becomes ONE argv element locally
+      (argv passing means the LOCAL side needs no extra quoting - subprocess does
+      not invoke a shell). We therefore shlex.quote ONLY the remote path portion.
+
+    Returns a list suitable for subprocess.run(..., shell=False).
+    """
+    ssh_opts = ssh_opts or []
+
+    user = msg["user"]
+    host = msg["host"]
+    remote_path = msg["path"]
+
+    # Quote the remote path for the remote shell. e.g. "/a b/c" -> "'/a b/c'".
+    quoted_remote = shlex.quote(remote_path)
+    remote_spec = "%s@%s:%s" % (user, host, quoted_remote)
+
+    args = ["scp", "-p", "-o", "BatchMode=yes"]
+    if msg["is_dir"]:
+        args.append("-r")
+    args.extend(ssh_opts)
+    # End-of-options terminator: defense in depth so nothing after it can be
+    # (mis)read as an scp option, even if validation upstream regressed.
+    args.append("--")
+    args.append(remote_spec)
+    args.append(dest_dir)
+    return args
+
+
+def build_open_args(local_path):
+    """Build the argv list for macOS `open`."""
+    return ["open", local_path]
+
+
+def build_signal_args(msg, status, ssh_opts=None):
+    """Build the argv for the back-channel signal write to the remote host.
+
+    After the daemon finishes handling a wait-mode message it ssh's back and
+    atomically drops ~/.lopen/signals/<nonce> so the blocked remote `lopen`
+    unblocks.
+
+    CRITICAL ssh-flattening gotcha: ssh does NOT preserve argv boundaries for
+    the remote command. It space-JOINS every operand after the destination into
+    a single string and hands that to the remote LOGIN shell to re-parse. So you
+    must NOT pass `bash -c <cmd> _ <status>` as separate argv elements - the
+    remote shell would re-split them (e.g. `ssh host bash -c mkdir -p ...` sends
+    the literal string "bash -c mkdir -p ...", so remotely `-c` grabs only
+    `mkdir` and `-p` becomes $0 -> "mkdir: missing operand"). Instead the ENTIRE
+    remote command must be ONE final argv element.
+
+    `status` is server-controlled ("ok" or "error\\n<reason>"), never attacker
+    text, so we shlex.quote it INLINE into that single command string (shlex
+    quoting handles the embedded newline in the error form). The nonce is
+    validated strictly alphanumeric and embedded directly.
+
+    Raises MessageError if the nonce is not strictly alphanumeric (it originates
+    from the untrusted message and is interpolated into the remote command).
+    """
+    ssh_opts = ssh_opts or []
+    nonce = msg.get("nonce", "")
+    if not _NONCE_RE.match(nonce):
+        raise MessageError("refusing to signal: invalid nonce %r" % nonce)
+
+    user = msg["user"]
+    host = msg["host"]
+
+    # Single remote command string. nonce is alphanumeric-validated so it is
+    # safe to embed directly; status is server-controlled and shell-quoted
+    # inline. Written atomically (.part then mv).
+    qstatus = shlex.quote(status)
+    remote_cmd = (
+        "mkdir -p ~/.lopen/signals && "
+        "printf %s {st} > ~/.lopen/signals/{n}.part && "
+        "mv ~/.lopen/signals/{n}.part ~/.lopen/signals/{n}"
+    ).format(st=qstatus, n=nonce)
+
+    args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    args.extend(ssh_opts)
+    # The remote command MUST be the single final argv element (see docstring):
+    # ssh space-joins remote operands, so any split here would be re-parsed.
+    args.extend(["--", "%s@%s" % (user, host), remote_cmd])
+    return args
+
+
+def local_dest_dir(msg, tmp_root, now=None):
+    """Compute the per-invocation temp directory path (does not create it)."""
+    now = now or _dt.datetime.now()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    # Nonce is hex from the remote; still sanitize to be safe as a dir name.
+    nonce = "".join(c for c in msg.get("nonce", "") if c.isalnum())[:16] or "x"
+    return os.path.join(tmp_root, "%s-%s" % (stamp, nonce))
+
+
+# --------------------------------------------------------------------------- #
+# Daemon (side-effecting)
+# --------------------------------------------------------------------------- #
+class Lopend:
+    def __init__(self, interval, tmp_dir, ssh_opts, log_path):
+        self.interval = interval
+        self.tmp_dir = tmp_dir
+        self.ssh_opts = ssh_opts
+        self.log_path = log_path
+        self._last_id = None
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+
+    def log(self, level, message):
+        line = "%s [%s] %s\n" % (
+            _dt.datetime.now().isoformat(timespec="seconds"),
+            level,
+            message,
+        )
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+        # Also echo to stderr so launchd captures it / interactive runs show it.
+        sys.stderr.write(line)
+        sys.stderr.flush()
+
+    def read_clipboard(self):
+        """Return the current clipboard text, or None on failure."""
+        try:
+            proc = subprocess.run(
+                ["pbpaste"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError as exc:
+            self.log("ERROR", "pbpaste failed to launch: %s" % exc)
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.decode("utf-8", errors="replace")
+
+    def handle_value(self, clipboard_value):
+        """Process one clipboard value. Returns True if it triggered a fetch."""
+        try:
+            msg = parse_message(clipboard_value)
+        except MessageError:
+            # Not our message (or malformed). Silent - the clipboard has lots of
+            # non-lopen content. We only log real processing errors below.
+            return False
+
+        mid = message_id(msg)
+        if mid == self._last_id:
+            return False  # Dedup: same message as last time.
+        self._last_id = mid
+
+        self.log(
+            "INFO",
+            "LOPEN1 %s@%s:%s (is_dir=%s wait=%s)"
+            % (msg["user"], msg["host"], msg["path"], msg["is_dir"], msg["wait"]),
+        )
+
+        # Fetch + open. On any failure we record a reason so the back-channel
+        # signal can report it. status is server-controlled text.
+        error_reason = self._fetch_and_open(msg)
+
+        if msg.get("wait"):
+            if error_reason is None:
+                self._signal_back(msg, "ok")
+            else:
+                self._signal_back(msg, "error\n%s" % error_reason)
+        return True
+
+    def _fetch_and_open(self, msg):
+        """scp the target then `open` it. Returns None on success, else a short
+        error reason string (used for the back-channel signal + logs)."""
+        dest = local_dest_dir(msg, self.tmp_dir)
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as exc:
+            reason = "cannot create dest dir: %s" % exc
+            self.log("ERROR", reason)
+            return reason
+
+        scp_args = build_scp_args(msg, dest, self.ssh_opts)
+        self.log("INFO", "scp: %s" % " ".join(shlex.quote(a) for a in scp_args))
+        try:
+            proc = subprocess.run(
+                scp_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            reason = "scp failed to launch: %s" % exc
+            self.log("ERROR", reason)
+            return reason
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            reason = "scp exited %d: %s" % (proc.returncode, detail)
+            self.log("ERROR", reason)
+            return reason
+
+        # scp writes the entry under the basename of the REMOTE PATH (not the
+        # separate, forgeable "name" field). Derive the local target from
+        # basename(path) so a crafted "name" (e.g. containing "../") can't make
+        # us `open` an arbitrary local path. os.path.basename strips any
+        # directory components defensively.
+        entry = os.path.basename(msg["path"].rstrip("/"))
+        local_path = os.path.join(dest, entry) if entry else dest
+        if not os.path.exists(local_path):
+            # Fallback: open the whole dest dir (something unexpected happened).
+            local_path = dest
+
+        open_args = build_open_args(local_path)
+        self.log("INFO", "open: %s" % " ".join(shlex.quote(a) for a in open_args))
+        try:
+            proc = subprocess.run(
+                open_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            reason = "open failed to launch: %s" % exc
+            self.log("ERROR", reason)
+            return reason
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()
+            reason = "open exited %d: %s" % (proc.returncode, detail)
+            self.log("ERROR", reason)
+            return reason
+
+        self.log("INFO", "opened %s" % local_path)
+        return None
+
+    def _signal_back(self, msg, status):
+        """ssh back to the remote and drop the signal file. Failures are logged
+        but never raised - a failed signal just means the remote will time out."""
+        try:
+            args = build_signal_args(msg, status, self.ssh_opts)
+        except MessageError as exc:
+            self.log("ERROR", "not signalling back: %s" % exc)
+            return
+        first_line = status.splitlines()[0] if status else status
+        self.log("INFO", "signal-back status=%s -> %s@%s"
+                 % (first_line, msg["user"], msg["host"]))
+        try:
+            proc = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            self.log("ERROR", "signal-back failed to launch: %s" % exc)
+            return
+        if proc.returncode != 0:
+            self.log(
+                "ERROR",
+                "signal-back ssh exited %d: %s"
+                % (proc.returncode, proc.stderr.decode("utf-8", "replace").strip()),
+            )
+
+    def run_once(self):
+        value = self.read_clipboard()
+        if value is None:
+            return False
+        return self.handle_value(value)
+
+    def run_forever(self):
+        self.log("INFO", "lopend started (interval=%.2fs tmp=%s)"
+                 % (self.interval, self.tmp_dir))
+        while True:
+            try:
+                self.run_once()
+            except Exception as exc:  # never crash the daemon
+                self.log("ERROR", "unexpected error: %s" % exc)
+            time.sleep(self.interval)
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def _env_interval():
+    """Read LOPEND_INTERVAL, falling back to DEFAULT_INTERVAL on any bad value.
+
+    Evaluated at argparse-build time, so a non-numeric env var must NOT crash
+    the process before the daemon starts.
+    """
+    raw = os.environ.get("LOPEND_INTERVAL")
+    if raw is None:
+        return DEFAULT_INTERVAL
+    try:
+        value = float(raw)
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+    except (TypeError, ValueError):
+        sys.stderr.write(
+            "lopend: ignoring invalid LOPEND_INTERVAL=%r; using %s\n"
+            % (raw, DEFAULT_INTERVAL)
+        )
+        return DEFAULT_INTERVAL
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="lopend",
+        description="Local macOS daemon for the lopen tool.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=_env_interval(),
+        help="Clipboard poll interval in seconds (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--tmp-dir",
+        default=os.environ.get("LOPEND_TMP_DIR", os.path.join(DEFAULT_HOME, "tmp")),
+        help="Root temp dir for fetched files (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=os.environ.get("LOPEND_LOG", os.path.join(DEFAULT_HOME, "lopend.log")),
+        help="Log file path (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--ssh-opts",
+        default=os.environ.get("LOPEND_SSH_OPTS", ""),
+        help="Extra ssh/scp options, space-separated (e.g. '-i ~/.ssh/id_x').",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Process the current clipboard once and exit (for testing).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    # shlex.split handles quoted ssh opts robustly; expand ~ in each token.
+    ssh_opts = [os.path.expanduser(t) for t in shlex.split(args.ssh_opts)]
+
+    daemon = Lopend(
+        interval=args.interval,
+        tmp_dir=os.path.expanduser(args.tmp_dir),
+        ssh_opts=ssh_opts,
+        log_path=os.path.expanduser(args.log_file),
+    )
+
+    if args.once:
+        # Exit 0 if we processed a LOPEN1 message this run, 1 otherwise. Handy
+        # for the testing workflow that --once is documented for.
+        triggered = daemon.run_once()
+        return 0 if triggered else 1
+    try:
+        daemon.run_forever()
+    except KeyboardInterrupt:
+        daemon.log("INFO", "lopend stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

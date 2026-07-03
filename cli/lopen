@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""lopen - local management CLI for the lopen tool (macOS side).
+
+This is the LOCAL counterpart to the remote `bin/lopen` script. They share a
+name but live on different machines, so there's no conflict: on your Mac this
+CLI manages the `lopend` daemon and provisions remote hosts; on the remote box
+`bin/lopen` is what you actually run to open a file.
+
+Subcommands:
+  setup <ssh-host>   Provision a remote host: ship bin/lopen, write remote
+                     config, verify, and ensure the local daemon is running.
+  doctor             Diagnose the local install + configured hosts (checklist).
+  install            Install/refresh the daemon + launchd agent (idempotent).
+  uninstall          Unload + remove the launchd agent.
+  start|stop|restart|status   Control the launchd agent.
+  logs [-f]          Show (or follow) the daemon log.
+
+Python 3 standard library only.
+
+Layout (see install/install-local.sh): this CLI installs to ~/.lopen/lopen,
+alongside ~/.lopen/lopend.py and ~/.lopen/remote-lopen (the script shipped to
+remotes). The pure/testable seams (build_remote_config, parse_hosts_file,
+split_ssh_host) have no side effects.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import json
+import os
+import re
+import subprocess
+import sys
+
+LOPEN_HOME = os.path.expanduser("~/.lopen")
+HOSTS_FILE = os.path.join(LOPEN_HOME, "hosts")
+LOG_FILE = os.path.join(LOPEN_HOME, "lopend.log")
+LABEL = "com.lopen.lopend"
+PLIST = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LABEL)
+
+CHECK = "✓"  # check mark
+CROSS = "✗"  # ballot X
+
+
+# --------------------------------------------------------------------------- #
+# Locating our companion files
+# --------------------------------------------------------------------------- #
+def _script_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_file(installed_name, repo_relpath):
+    """Locate a companion file both when running installed (~/.lopen/) and when
+    running from the repo checkout (cli/lopen with siblings ../lopend, ../bin)."""
+    here = _script_dir()
+    candidates = [
+        os.path.join(here, installed_name),          # installed layout
+        os.path.join(here, "..", repo_relpath),       # repo layout
+        os.path.join(LOPEN_HOME, installed_name),     # explicit ~/.lopen
+    ]
+    for c in candidates:
+        c = os.path.abspath(c)
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def find_lopend():
+    return find_file("lopend.py", "lopend/lopend.py")
+
+
+def find_remote_lopen():
+    return find_file("remote-lopen", "bin/lopen")
+
+
+# --------------------------------------------------------------------------- #
+# Pure / testable helpers
+# --------------------------------------------------------------------------- #
+class SshHostError(ValueError):
+    """Raised when an ssh-host string is unsafe to use."""
+
+
+# ssh targets: an optional user, then a host. We allow the usual host/alias and
+# username characters. Crucially this forbids newline/carriage-return, so an
+# ssh-host can never inject extra KEY=value lines into the remote config file.
+_SSH_HOST_RE = re.compile(r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+$")
+
+
+def validate_ssh_host(ssh_host):
+    """Return the stripped ssh-host if safe, else raise SshHostError.
+
+    Rejects newlines/CR (config-line injection) and anything outside a
+    conservative user@host charset.
+    """
+    s = ssh_host.strip()
+    if not s:
+        raise SshHostError("ssh-host is empty")
+    # Reject interior newlines/CR (config-line injection). A trailing newline
+    # from the shell strips away above; an injection like "host\nKEY=val" leaves
+    # the newline INSIDE the stripped value, which we catch here.
+    if any(c in s for c in "\r\n"):
+        raise SshHostError("ssh-host must not contain newlines")
+    if not _SSH_HOST_RE.match(s):
+        raise SshHostError("ssh-host has invalid characters: %r" % ssh_host)
+    return s
+
+
+def split_ssh_host(ssh_host):
+    """Split an ssh target into (user, host).
+
+    `ssh_host` is the EXACT string the user ssh's with. It may be:
+      - a bare alias / hostname:  "mydev"           -> (None, "mydev")
+      - user@host:                "alice@mydev"      -> ("alice", "mydev")
+
+    The host portion is what the local daemon must scp back to, so for an alias
+    we keep the alias verbatim (ssh_config resolves it on both ends).
+    """
+    ssh_host = ssh_host.strip()
+    if "@" in ssh_host:
+        user, host = ssh_host.split("@", 1)
+        return (user or None, host)
+    return (None, ssh_host)
+
+
+def build_remote_config(ssh_host, local_user=None, wait_timeout=None):
+    """Build the contents of the remote ~/.lopen/config file.
+
+    LOPEN_HOST = the host portion the daemon will scp back to. LOPEN_USER is
+    written only when the ssh target specifies a user that differs from the
+    remote's own $USER (we can't know the remote $USER here, so we always write
+    LOPEN_USER when the ssh target carried one - harmless and explicit).
+
+    Validates ssh_host first (raises SshHostError) so a malicious/typo'd value
+    (e.g. containing a newline) cannot inject extra lines into the remote config.
+    """
+    ssh_host = validate_ssh_host(ssh_host)
+    user, host = split_ssh_host(ssh_host)
+    lines = [
+        "# Managed by `lopen setup` on your Mac. KEY=value lines only.",
+        "LOPEN_HOST=%s" % host,
+    ]
+    if user:
+        lines.append("LOPEN_USER=%s" % user)
+    if wait_timeout is not None:
+        lines.append("LOPEN_WAIT_TIMEOUT=%s" % int(wait_timeout))
+    return "\n".join(lines) + "\n"
+
+
+def parse_hosts_file(text):
+    """Parse the ~/.lopen/hosts file text into a deduped, ordered list.
+
+    One ssh-host per line. Blank lines and lines starting with '#' are ignored.
+    Order preserved, duplicates removed.
+    """
+    seen = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line not in seen:
+            seen.append(line)
+    return seen
+
+
+def add_host_to_text(existing_text, ssh_host):
+    """Return updated hosts-file text with ssh_host added (deduped)."""
+    hosts = parse_hosts_file(existing_text)
+    if ssh_host not in hosts:
+        hosts.append(ssh_host)
+    return "\n".join(hosts) + "\n" if hosts else ""
+
+
+def decode_lopen1(printed):
+    """Decode a LOPEN1 clipboard string into its JSON dict (for verification)."""
+    printed = printed.strip()
+    if not printed.startswith("LOPEN1:"):
+        raise ValueError("output is not a LOPEN1 message")
+    body = "".join(printed[len("LOPEN1:"):].split())
+    try:
+        raw = base64.b64decode(body)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("bad base64: %s" % exc)
+    return json.loads(raw.decode("utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+# Small process helpers
+# --------------------------------------------------------------------------- #
+def run(args, **kw):
+    """subprocess.run wrapper capturing text output; never raises on non-zero."""
+    return subprocess.run(
+        args,
+        stdout=kw.pop("stdout", subprocess.PIPE),
+        stderr=kw.pop("stderr", subprocess.PIPE),
+        text=True,
+        check=False,
+        **kw,
+    )
+
+
+def which(name):
+    return subprocess.run(["which", name], stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, text=True,
+                          check=False).stdout.strip() or None
+
+
+def hosts_list():
+    if not os.path.exists(HOSTS_FILE):
+        return []
+    with open(HOSTS_FILE, encoding="utf-8") as fh:
+        return parse_hosts_file(fh.read())
+
+
+def read_hosts_text():
+    if not os.path.exists(HOSTS_FILE):
+        return ""
+    with open(HOSTS_FILE, encoding="utf-8") as fh:
+        return fh.read()
+
+
+# --------------------------------------------------------------------------- #
+# launchd plist + daemon install
+# --------------------------------------------------------------------------- #
+def plist_contents(python_path, lopend_path):
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key>
+\t<string>{label}</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>{python}</string>
+\t\t<string>{lopend}</string>
+\t</array>
+\t<key>RunAtLoad</key>
+\t<true/>
+\t<key>KeepAlive</key>
+\t<true/>
+\t<key>StandardOutPath</key>
+\t<string>{home}/lopend.out.log</string>
+\t<key>StandardErrorPath</key>
+\t<string>{home}/lopend.err.log</string>
+</dict>
+</plist>
+""".format(label=LABEL, python=python_path, lopend=lopend_path, home=LOPEN_HOME)
+
+
+def cmd_install(args):
+    """Install/refresh the daemon and (re)load the launchd agent. Idempotent."""
+    os.makedirs(LOPEN_HOME, exist_ok=True)
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+
+    src = find_lopend()
+    if not src:
+        print("error: cannot locate lopend.py", file=sys.stderr)
+        return 1
+    dest = os.path.join(LOPEN_HOME, "lopend.py")
+    if os.path.abspath(src) != os.path.abspath(dest):
+        with open(src, "rb") as fh:
+            data = fh.read()
+        with open(dest, "wb") as fh:
+            fh.write(data)
+    os.chmod(dest, 0o755)
+    print("Installed daemon -> %s" % dest)
+
+    python_path = which("python3") or "/usr/bin/python3"
+    with open(PLIST, "w", encoding="utf-8") as fh:
+        fh.write(plist_contents(python_path, dest))
+    print("Wrote launchd plist -> %s (python: %s)" % (PLIST, python_path))
+
+    run(["launchctl", "unload", PLIST])  # ignore errors if not loaded
+    load = run(["launchctl", "load", PLIST])
+    if load.returncode != 0:
+        print("warning: launchctl load returned %d: %s"
+              % (load.returncode, load.stderr.strip()), file=sys.stderr)
+    else:
+        print("Loaded launchd job: %s" % LABEL)
+    return 0
+
+
+def cmd_uninstall(args):
+    if os.path.exists(PLIST):
+        run(["launchctl", "unload", PLIST])
+        os.remove(PLIST)
+        print("Unloaded and removed %s" % PLIST)
+    else:
+        print("No plist at %s (already uninstalled)." % PLIST)
+    print("Note: ~/.lopen/ (logs + temp) left in place. rm -rf ~/.lopen to purge.")
+    return 0
+
+
+def _launchctl_loaded():
+    out = run(["launchctl", "list"]).stdout
+    return any(LABEL in line for line in out.splitlines())
+
+
+def cmd_start(args):
+    if not os.path.exists(PLIST):
+        print("Not installed. Run: lopen install", file=sys.stderr)
+        return 1
+    r = run(["launchctl", "load", PLIST])
+    if r.returncode != 0:
+        print("failed to start %s: %s" % (LABEL, r.stderr.strip()),
+              file=sys.stderr)
+        return 1
+    print("Started %s" % LABEL)
+    return 0
+
+
+def cmd_stop(args):
+    r = run(["launchctl", "unload", PLIST])
+    if r.returncode != 0:
+        print("failed to stop %s: %s" % (LABEL, r.stderr.strip()),
+              file=sys.stderr)
+        return 1
+    print("Stopped %s" % LABEL)
+    return 0
+
+
+def cmd_restart(args):
+    # kickstart -k restarts if loaded; fall back to unload/load.
+    uid = os.getuid()
+    ks = run(["launchctl", "kickstart", "-k", "gui/%d/%s" % (uid, LABEL)])
+    if ks.returncode == 0:
+        print("Restarted %s" % LABEL)
+        return 0
+    run(["launchctl", "unload", PLIST])
+    load = run(["launchctl", "load", PLIST])
+    if load.returncode != 0:
+        print("failed to restart %s: %s" % (LABEL, load.stderr.strip()),
+              file=sys.stderr)
+        return 1
+    print("Restarted %s" % LABEL)
+    return 0
+
+
+def cmd_status(args):
+    if _launchctl_loaded():
+        print("%s loaded." % LABEL)
+        print(run(["launchctl", "list", LABEL]).stdout.rstrip())
+        return 0
+    print("%s NOT loaded." % LABEL)
+    return 1
+
+
+def cmd_logs(args):
+    if not os.path.exists(LOG_FILE):
+        print("No log at %s yet." % LOG_FILE, file=sys.stderr)
+        return 1
+    if args.follow:
+        try:
+            os.execvp("tail", ["tail", "-f", LOG_FILE])
+        except OSError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 1
+    else:
+        with open(LOG_FILE, encoding="utf-8") as fh:
+            sys.stdout.write(fh.read())
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# setup
+# --------------------------------------------------------------------------- #
+def cmd_setup(args):
+    # Validate the ssh-host up front (fail fast, before any ssh, and reject
+    # config-injection attempts).
+    try:
+        ssh_host = validate_ssh_host(args.ssh_host)
+    except SshHostError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    remote_dir = args.remote_dir
+    ssh_opts = args.ssh_opts.split() if args.ssh_opts else []
+    user, host = split_ssh_host(ssh_host)
+
+    remote_lopen = find_remote_lopen()
+    if not remote_lopen:
+        print("error: cannot locate the remote lopen script to ship "
+              "(expected ~/.lopen/remote-lopen or ../bin/lopen).", file=sys.stderr)
+        return 1
+
+    print("Setting up remote host: %s" % ssh_host)
+    print("  (user=%s host=%s remote-dir=%s)" % (user or "$USER", host, remote_dir))
+
+    def ssh(remote_cmd, **kw):
+        return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                    *ssh_opts, "--", ssh_host, remote_cmd], **kw)
+
+    # 1. Ensure remote dir, then scp the script into place + chmod.
+    mk = ssh("mkdir -p %s" % _shq(remote_dir))
+    if mk.returncode != 0:
+        print("%s could not ssh / mkdir on remote: %s"
+              % (CROSS, mk.stderr.strip()), file=sys.stderr)
+        return 1
+
+    remote_target = "%s/lopen" % remote_dir.rstrip("/")
+    scp = run(["scp", "-o", "BatchMode=yes", *ssh_opts, "--",
+               remote_lopen, "%s:%s" % (ssh_host, remote_target)])
+    if scp.returncode != 0:
+        print("%s scp of lopen failed: %s" % (CROSS, scp.stderr.strip()),
+              file=sys.stderr)
+        return 1
+    ch = ssh("chmod +x %s" % _shq(remote_target))
+    if ch.returncode != 0:
+        print("%s could not chmod +x remote lopen: %s"
+              % (CROSS, ch.stderr.strip()), file=sys.stderr)
+        return 1
+    print("%s shipped lopen -> %s:%s" % (CHECK, ssh_host, remote_target))
+
+    # 2. Write remote ~/.lopen/config (never sourced remotely; KEY=value only).
+    config_text = build_remote_config(ssh_host, wait_timeout=args.wait_timeout)
+    wr = ssh("mkdir -p ~/.lopen && cat > ~/.lopen/config",
+             input=config_text)
+    if wr.returncode != 0:
+        print("%s could not write remote config: %s" % (CROSS, wr.stderr.strip()),
+              file=sys.stderr)
+        return 1
+    print("%s wrote remote ~/.lopen/config (LOPEN_HOST=%s)" % (CHECK, host))
+
+    # 3. Record the host locally for `doctor`.
+    _record_host(ssh_host)
+    print("%s recorded host locally in %s" % (CHECK, HOSTS_FILE))
+
+    # 4. Verify: run remote lopen --print and check host matches config. Probe
+    # "/" since it always exists and is readable (unlike, say, /etc/hostname).
+    verify = ssh("%s --print /" % _shq(remote_target))
+    if verify.returncode != 0:
+        print("%s verification run failed: %s" % (CROSS, verify.stderr.strip()),
+              file=sys.stderr)
+        return 1
+    try:
+        msg = decode_lopen1(verify.stdout)
+    except ValueError as exc:
+        print("%s verification output not a valid LOPEN1 message: %s"
+              % (CROSS, exc), file=sys.stderr)
+        return 1
+    if msg.get("host") != host:
+        print("%s embedded host %r != configured LOPEN_HOST %r"
+              % (CROSS, msg.get("host"), host), file=sys.stderr)
+        return 1
+    print("%s verified: remote lopen emits host=%s" % (CHECK, msg.get("host")))
+
+    # 5. Ensure the local daemon is installed + loaded.
+    rc = cmd_install(args)
+    if rc != 0:
+        return rc
+
+    print()
+    print("Setup complete. From an ssh session on %s, run:  lopen <path>" % ssh_host)
+    print("(ensure %s is on your PATH there)" % remote_dir)
+    return 0
+
+
+def _record_host(ssh_host):
+    os.makedirs(LOPEN_HOME, exist_ok=True)
+    existing = read_hosts_text()
+    updated = add_host_to_text(existing, ssh_host)
+    with open(HOSTS_FILE, "w", encoding="utf-8") as fh:
+        fh.write(updated)
+
+
+def _shq(s):
+    """Minimal shell-quote for building remote command strings."""
+    import shlex
+    return shlex.quote(s)
+
+
+# --------------------------------------------------------------------------- #
+# doctor
+# --------------------------------------------------------------------------- #
+def cmd_doctor(args):
+    ok = True
+
+    def check(passed, label, detail=""):
+        nonlocal ok
+        mark = CHECK if passed else CROSS
+        line = "%s %s" % (mark, label)
+        if detail:
+            line += " - %s" % detail
+        print(line)
+        if not passed:
+            ok = False
+
+    print("=== local tools ===")
+    for tool in ("python3", "pbpaste", "pbcopy", "open", "scp", "ssh"):
+        p = which(tool)
+        check(p is not None, tool, p or "NOT FOUND")
+
+    print("\n=== daemon ===")
+    loaded = _launchctl_loaded()
+    check(loaded, "launchd agent %s loaded" % LABEL,
+          "run 'lopen install' if missing" if not loaded else "")
+
+    if os.path.exists(LOG_FILE):
+        last = ""
+        try:
+            with open(LOG_FILE, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+                last = lines[-1] if lines else ""
+        except OSError:
+            pass
+        check(True, "log file present", "%s" % LOG_FILE)
+        if last:
+            print("    last: %s" % last)
+    else:
+        check(False, "log file present", "%s (daemon hasn't run yet?)" % LOG_FILE)
+
+    print("\n=== configured hosts ===")
+    hosts = hosts_list()
+    if not hosts:
+        print("(none - run 'lopen setup <ssh-host>')")
+    for h in hosts:
+        # Reverse reachability + remote install check in one round-trip.
+        r = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", h,
+                 "test -x ~/bin/lopen && echo INSTALLED || echo MISSING"])
+        if r.returncode != 0:
+            check(False, "reach %s" % h,
+                  "ssh failed: %s" % (r.stderr.strip() or "unreachable"))
+            continue
+        installed = "INSTALLED" in r.stdout
+        check(True, "reach %s" % h, "ssh OK")
+        check(installed, "  remote ~/bin/lopen present on %s" % h,
+              "" if installed else "run 'lopen setup %s'" % h)
+
+    print("\n=== terminal ===")
+    print("  Reminder: OSC52 clipboard writes require a supporting terminal.")
+    print("  iTerm2: enable 'Applications in terminal may access clipboard'.")
+    print("  Terminal.app does NOT support OSC52 writes.")
+
+    print()
+    print("Doctor: %s" % ("all critical checks passed" if ok else "PROBLEMS FOUND"))
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="lopen",
+        description="Manage the lopen local daemon and provision remote hosts.",
+    )
+    sub = p.add_subparsers(dest="command")
+
+    s = sub.add_parser("setup", help="Provision a remote host (ship + config + verify).")
+    s.add_argument("ssh_host", help="Exact ssh target (alias or user@host).")
+    s.add_argument("--remote-dir", default="~/bin",
+                   help="Remote dir to install lopen into (default: ~/bin).")
+    s.add_argument("--ssh-opts", default="", help="Extra ssh/scp options.")
+    s.add_argument("--wait-timeout", type=int, default=None,
+                   help="Set LOPEN_WAIT_TIMEOUT in the remote config.")
+    s.set_defaults(func=cmd_setup)
+
+    d = sub.add_parser("doctor", help="Diagnose local install and hosts.")
+    d.set_defaults(func=cmd_doctor)
+
+    i = sub.add_parser("install", help="Install/refresh the daemon + launchd agent.")
+    i.set_defaults(func=cmd_install)
+
+    u = sub.add_parser("uninstall", help="Unload + remove the launchd agent.")
+    u.set_defaults(func=cmd_uninstall)
+
+    sub.add_parser("start", help="Load the launchd agent.").set_defaults(func=cmd_start)
+    sub.add_parser("stop", help="Unload the launchd agent.").set_defaults(func=cmd_stop)
+    sub.add_parser("restart", help="Restart the launchd agent.").set_defaults(func=cmd_restart)
+    sub.add_parser("status", help="Show launchd agent status.").set_defaults(func=cmd_status)
+
+    lg = sub.add_parser("logs", help="Show the daemon log.")
+    lg.add_argument("-f", "--follow", action="store_true", help="Follow (tail -f).")
+    lg.set_defaults(func=cmd_logs)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

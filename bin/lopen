@@ -1,0 +1,411 @@
+#!/bin/bash
+#
+# lopen - open a remote file/dir on your LOCAL Mac.
+#
+# Runs on a remote Linux host (over ssh). It gathers metadata about the target
+# path and emits an OSC 52 escape sequence that sets your LOCAL Mac clipboard to
+# a magic-prefixed LOPEN1 message. A local daemon (lopend) sees that message,
+# scp's the file down, and runs macOS `open` on it.
+#
+# By default lopen then BLOCKS until the local daemon signals back (via a small
+# file dropped over ssh into ~/.lopen/signals/<nonce>), so the command exits
+# only once the file has actually opened on your Mac. Use --no-wait to fire and
+# forget.
+#
+# Protocol: LOPEN1 (see README.md). Zero deps beyond coreutils + base64.
+#
+set -euo pipefail
+
+PROG="$(basename "$0")"
+
+CONFIG_FILE="$HOME/.lopen/config"
+SIGNAL_DIR="$HOME/.lopen/signals"
+
+# Defaults (overridable via ~/.lopen/config or environment).
+DEFAULT_WAIT_TIMEOUT=45
+WAIT_POLL_INTERVAL=0.3
+
+usage() {
+	cat <<EOF
+Usage: $PROG [--no-wait] <path>
+       $PROG --print <path>
+       $PROG -h | --help
+
+Open a remote file or directory on your local Mac.
+
+Arguments:
+  <path>          File or directory to open. Resolved to an absolute path.
+
+Options:
+  --no-wait       Fire and forget: emit the OSC 52 sequence and exit immediately
+                  without waiting for the local daemon to confirm the open.
+  --print         Print the raw LOPEN1 clipboard string to stdout instead of
+                  emitting the OSC 52 terminal sequence. Never blocks. Useful
+                  for testing (pipe it into pbcopy).
+  -h, --help      Show this help.
+
+Config (~/.lopen/config, KEY=value lines):
+  LOPEN_HOST          Host the local daemon should scp back from (defaults to
+                      \`hostname -f\`). Set by \`lopen setup\` on your Mac.
+  LOPEN_USER          User for the scp-back (defaults to \$USER).
+  LOPEN_WAIT_TIMEOUT  Seconds to wait for the local open (default $DEFAULT_WAIT_TIMEOUT).
+
+Requires the local 'lopend' daemon running on your Mac and a terminal that
+supports OSC 52 clipboard writes (e.g. iTerm2 with clipboard access enabled).
+EOF
+}
+
+err() {
+	printf '%s: %s\n' "$PROG" "$*" >&2
+}
+
+# --- Config parsing -----------------------------------------------------------
+# Read a single KEY from ~/.lopen/config WITHOUT sourcing the file (never
+# execute its contents). We only match lines of the form `KEY=value`, take the
+# last such line, and strip surrounding quotes. Prints the value (empty if unset)
+config_get() {
+	local key=$1
+	[ -f "$CONFIG_FILE" ] || return 0
+	local line value
+	# Grep exact `KEY=` at start of line; take the last match.
+	line=$(grep -E "^${key}=" "$CONFIG_FILE" 2>/dev/null | tail -n1) || true
+	[ -n "$line" ] || return 0
+	value=${line#*=}
+	# Strip a single pair of surrounding single or double quotes.
+	case "$value" in
+	\"*\") value=${value#\"}; value=${value%\"} ;;
+	\'*\') value=${value#\'}; value=${value%\'} ;;
+	esac
+	printf '%s' "$value"
+}
+
+# --- JSON string escaping -----------------------------------------------------
+# Escape a raw string for safe embedding inside a JSON double-quoted string.
+# Handles backslash, double-quote, and control characters. Paths on Linux can
+# contain almost anything except NUL, so this must be robust.
+json_escape() {
+	local s=$1
+	# Backslash first, then double quote.
+	s=${s//\\/\\\\}
+	s=${s//\"/\\\"}
+	# Common control characters.
+	s=${s//$'\t'/\\t}
+	s=${s//$'\n'/\\n}
+	s=${s//$'\r'/\\r}
+	printf '%s' "$s"
+}
+
+# base64-encode stdin with NO line wrapping. Both GNU and BusyBox base64 differ
+# on the wrapping flag, so we just strip newlines ourselves for portability.
+b64_nowrap() {
+	base64 | tr -d '\n'
+}
+
+# Generate 16 random hex characters from /dev/urandom (falls back to $RANDOM).
+gen_nonce() {
+	if [ -r /dev/urandom ]; then
+		# 8 bytes -> 16 hex chars.
+		od -An -tx1 -N8 /dev/urandom | tr -d ' \n'
+	else
+		printf '%04x%04x%04x%04x' \
+			"$((RANDOM))" "$((RANDOM))" "$((RANDOM))" "$((RANDOM))"
+	fi
+}
+
+# Extract the "nonce" field from a LOPEN1 string S (base64(JSON) after the
+# prefix). Uses only base64 + sed so it works with no extra deps. Prints the
+# nonce, or returns non-zero if it can't be found.
+#
+# The nonce is generated locally by gen_nonce as 16 hex chars, so we match a
+# hex run specifically (rather than a greedy `[^"]*`) to avoid picking up a
+# lookalike `"nonce":"..."` substring inside an attacker-influenced path/name
+# field elsewhere in the JSON.
+nonce_from_message() {
+	local s=$1
+	local json nonce
+	json=$(printf '%s' "${s#LOPEN1:}" | base64 -d 2>/dev/null) || return 1
+	nonce=$(printf '%s' "$json" | sed -n 's/.*"nonce":"\([0-9a-fA-F]\{1,\}\)".*/\1/p')
+	[ -n "$nonce" ] || return 1
+	printf '%s' "$nonce"
+}
+
+# --- Build the LOPEN1 clipboard string S for a given path ---------------------
+build_message() {
+	local target=$1
+	local want_wait=$2 # "true" or "false" -> emits the "wait" JSON field
+
+	if [ ! -e "$target" ]; then
+		err "path does not exist: $target"
+		return 1
+	fi
+
+	# Absolute, canonical path. Prefer realpath; fall back to readlink -f; then
+	# to a manual cd-based resolution for maximum portability.
+	local abspath
+	if command -v realpath >/dev/null 2>&1; then
+		abspath=$(realpath -- "$target")
+	elif readlink -f -- "$target" >/dev/null 2>&1; then
+		abspath=$(readlink -f -- "$target")
+	else
+		# Manual fallback: resolve dir via cd, keep basename.
+		local d b
+		d=$(dirname -- "$target")
+		b=$(basename -- "$target")
+		abspath="$(cd -- "$d" && pwd)/$b"
+	fi
+
+	local name is_dir size mtime
+	name=$(basename -- "$abspath")
+
+	if [ -d "$abspath" ]; then
+		is_dir=true
+	else
+		is_dir=false
+	fi
+
+	# size + mtime via `stat`. GNU stat uses -c, BSD uses -f. We try GNU first.
+	if size=$(stat -c '%s' -- "$abspath" 2>/dev/null); then
+		mtime=$(stat -c '%Y' -- "$abspath" 2>/dev/null || printf 'null')
+	elif size=$(stat -f '%z' -- "$abspath" 2>/dev/null); then
+		mtime=$(stat -f '%m' -- "$abspath" 2>/dev/null || printf 'null')
+	else
+		size=null
+		mtime=null
+	fi
+	# Directories: size is meaningless, report null.
+	if [ "$is_dir" = true ]; then
+		size=null
+	fi
+	# Guard against empty stat results.
+	[ -n "$size" ] || size=null
+	[ -n "$mtime" ] || mtime=null
+
+	# host/user come from config if set (so the daemon knows the scp-reachable
+	# identity, which may differ from the box's own hostname), else fall back.
+	local host user nonce cfg_host cfg_user
+	cfg_host=$(config_get LOPEN_HOST)
+	cfg_user=$(config_get LOPEN_USER)
+	host=${cfg_host:-$(hostname -f 2>/dev/null || hostname)}
+	user=${cfg_user:-${USER:-$(id -un)}}
+	nonce=$(gen_nonce)
+
+	# Assemble compact JSON (no spaces). Non-numeric fields are JSON-escaped.
+	# The optional "wait" field is emitted only when blocking.
+	local wait_field=""
+	if [ "$want_wait" = true ]; then
+		wait_field=',"wait":true'
+	fi
+
+	local json
+	json=$(printf '{"v":1,"host":"%s","user":"%s","path":"%s","name":"%s","is_dir":%s,"size":%s,"mtime":%s,"nonce":"%s"%s}' \
+		"$(json_escape "$host")" \
+		"$(json_escape "$user")" \
+		"$(json_escape "$abspath")" \
+		"$(json_escape "$name")" \
+		"$is_dir" \
+		"$size" \
+		"$mtime" \
+		"$(json_escape "$nonce")" \
+		"$wait_field")
+
+	# S = "LOPEN1:" + base64(JSON), no line wrapping.
+	printf 'LOPEN1:%s' "$(printf '%s' "$json" | b64_nowrap)"
+}
+
+# --- OSC 52 emission ----------------------------------------------------------
+# The clipboard string S is itself base64-encoded to form the OSC 52 payload.
+# This is the crucial DOUBLE-ENCODING:
+#   - S already contains base64(JSON) after the "LOPEN1:" prefix.
+#   - OSC 52 requires its clipboard payload to be base64. So we base64-encode
+#     the WHOLE string S again. The terminal decodes that layer and sets the
+#     clipboard to exactly S.
+#
+# Sequence: ESC ] 52 ; c ; <base64(S)> BEL
+#   ESC = \033, BEL = \007, c = "clipboard" selection.
+#
+# tmux passthrough: tmux swallows OSC sequences unless wrapped in a DCS
+# passthrough. The rule is: ESC P tmux ; <inner> ESC \, where every ESC inside
+# <inner> must be DOUBLED. screen uses a similar DCS wrapper that ALSO requires
+# ESC doubling.
+emit_osc52() {
+	local s=$1
+	local payload seq
+	payload=$(printf '%s' "$s" | b64_nowrap)
+
+	local ESC=$'\033'
+	local BEL=$'\007'
+
+	# The bare OSC 52 sequence.
+	seq="${ESC}]52;c;${payload}${BEL}"
+
+	# Detect a multiplexer and wrap accordingly.
+	case "${TERM:-}" in
+	screen*)
+		if [ -n "${TMUX:-}" ]; then
+			seq=$(tmux_wrap "$seq")
+		else
+			seq=$(screen_wrap "$seq")
+		fi
+		;;
+	*)
+		if [ -n "${TMUX:-}" ]; then
+			seq=$(tmux_wrap "$seq")
+		fi
+		;;
+	esac
+
+	# Emit to the controlling terminal if we have one, else stdout. The tty may
+	# exist but be unwritable in odd setups, so try /dev/tty and fall back to
+	# stdout on any failure.
+	{ printf '%s' "$seq" >/dev/tty; } 2>/dev/null || printf '%s' "$seq"
+}
+
+# Wrap a sequence for tmux DCS passthrough. Every ESC in the inner sequence
+# must be doubled so tmux forwards it verbatim to the outer terminal.
+tmux_wrap() {
+	local inner=$1
+	local ESC=$'\033'
+	# Double every ESC.
+	inner=${inner//$ESC/$ESC$ESC}
+	printf '%sPtmux;%s%s\\' "$ESC" "$inner" "$ESC"
+}
+
+# Wrap for GNU screen DCS. screen also requires ESC to be doubled inside the
+# passthrough (best-effort: screen's OSC 52 support varies by version).
+screen_wrap() {
+	local inner=$1
+	local ESC=$'\033'
+	inner=${inner//$ESC/$ESC$ESC}
+	printf '%sP%s%s\\' "$ESC" "$inner" "$ESC"
+}
+
+# --- Wait for the local daemon's signal ---------------------------------------
+# Polls ~/.lopen/signals/<nonce> until it appears or we time out. The file's
+# first line is the status ("ok" or "error"); the rest is optional detail.
+# Returns: 0 on ok, 1 on error, 2 on timeout.
+wait_for_signal() {
+	local nonce=$1
+	local timeout=$2
+	local sigfile="$SIGNAL_DIR/$nonce"
+
+	# Deadline against the wall clock (SECONDS resets to 0 here) so the total
+	# wait honours $timeout regardless of per-iteration work (head/tail/sleep).
+	SECONDS=0
+	local announced=false
+	while [ "$SECONDS" -lt "$timeout" ]; do
+		if [ -f "$sigfile" ]; then
+			local status detail
+			status=$(head -n1 "$sigfile" 2>/dev/null || printf 'error')
+			detail=$(tail -n +2 "$sigfile" 2>/dev/null || true)
+			# Strip control chars from the (potentially remote-influenced) detail
+			# before echoing it to this terminal, to avoid escape-seq injection.
+			detail=$(printf '%s' "$detail" | tr -d '\000-\010\013\014\016-\037')
+			rm -f "$sigfile"
+			if [ "$status" = ok ]; then
+				err "opened on local Mac."
+				return 0
+			else
+				err "local open failed: ${detail:-unknown error}"
+				return 1
+			fi
+		fi
+		if [ "$announced" = false ]; then
+			err "waiting for local open..."
+			announced=true
+		fi
+		sleep "$WAIT_POLL_INTERVAL"
+	done
+
+	rm -f "$sigfile" 2>/dev/null || true
+	err "no response from local lopend within ${timeout}s - is the daemon running"
+	err "and does your terminal forward OSC52? Run 'lopen doctor' on your Mac."
+	return 2
+}
+
+# --- Argument parsing ---------------------------------------------------------
+main() {
+	local mode=emit
+	local do_wait=true
+	local target=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-h | --help)
+			usage
+			return 0
+			;;
+		--print)
+			mode=print
+			shift
+			;;
+		--no-wait)
+			do_wait=false
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			err "unknown option: $1"
+			usage >&2
+			return 2
+			;;
+		*)
+			break
+			;;
+		esac
+	done
+
+	if [ $# -gt 0 ]; then
+		target=$1
+		shift
+	fi
+
+	if [ -z "$target" ]; then
+		err "missing <path>"
+		usage >&2
+		return 2
+	fi
+
+	# --print never blocks and never advertises wait.
+	if [ "$mode" = print ]; then
+		local s
+		s=$(build_message "$target" false) || return 1
+		printf '%s\n' "$s"
+		return 0
+	fi
+
+	# Emit mode. Prepare the signal dir up front (so a fast daemon can't race us).
+	if [ "$do_wait" = true ]; then
+		mkdir -p "$SIGNAL_DIR"
+	fi
+
+	local s
+	s=$(build_message "$target" "$do_wait") || return 1
+	emit_osc52 "$s"
+
+	if [ "$do_wait" = true ]; then
+		# Recover the nonce from S itself (build_message runs in a subshell, so
+		# any global it set would not survive - we decode it here in the parent).
+		local nonce
+		nonce=$(nonce_from_message "$s") || {
+			# We emitted but can't poll for confirmation - report as unconfirmed
+			# (timeout semantics), NOT success.
+			err "could not determine signal nonce; cannot confirm local open."
+			return 2
+		}
+
+		local timeout
+		timeout=$(config_get LOPEN_WAIT_TIMEOUT)
+		timeout=${LOPEN_WAIT_TIMEOUT:-${timeout:-$DEFAULT_WAIT_TIMEOUT}}
+		# Sanity-check numeric; fall back to default.
+		case "$timeout" in
+		'' | *[!0-9]*) timeout=$DEFAULT_WAIT_TIMEOUT ;;
+		esac
+		wait_for_signal "$nonce" "$timeout"
+		return $?
+	fi
+}
+
+main "$@"
