@@ -36,8 +36,8 @@ import sys
 
 LOPEN_HOME = os.path.expanduser("~/.lopen")
 HOSTS_FILE = os.path.join(LOPEN_HOME, "hosts")
-LOG_FILE = os.path.join(LOPEN_HOME, "lopend.log")
 LABEL = "com.lopen.lopend"
+BREW_LABEL = "homebrew.mxcl.lopen"
 PLIST = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LABEL)
 
 CHECK = "✓"  # check mark
@@ -52,10 +52,17 @@ def _script_dir():
 
 
 def find_file(installed_name, repo_relpath):
-    """Locate a companion file both when running installed (~/.lopen/) and when
-    running from the repo checkout (cli/lopen with siblings ../lopend, ../bin)."""
+    """Locate a companion file across install layouts:
+      - Homebrew: $LOPEN_LIBEXEC/<installed_name> (formula sets LOPEN_LIBEXEC)
+      - installed (~/.lopen/): sibling of this script
+      - repo checkout: cli/lopen with siblings ../lopend, ../bin
+    Homebrew's libexec takes precedence when LOPEN_LIBEXEC is set."""
     here = _script_dir()
-    candidates = [
+    candidates = []
+    libexec = os.environ.get("LOPEN_LIBEXEC")
+    if libexec:
+        candidates.append(os.path.join(libexec, installed_name))  # brew libexec
+    candidates += [
         os.path.join(here, installed_name),          # installed layout
         os.path.join(here, "..", repo_relpath),       # repo layout
         os.path.join(LOPEN_HOME, installed_name),     # explicit ~/.lopen
@@ -73,6 +80,51 @@ def find_lopend():
 
 def find_remote_lopen():
     return find_file("remote-lopen", "bin/lopen")
+
+
+# --------------------------------------------------------------------------- #
+# Service mode: launchd (~/.lopen) vs. Homebrew (brew services)
+# --------------------------------------------------------------------------- #
+def detect_service_mode(script_dir, env):
+    """Return "brew" or "launchd" for the given script dir and env dict (pure).
+
+    Homebrew mode is detected when:
+      - LOPEN_LIBEXEC is set (the formula's bin wrapper sets it), OR
+      - this CLI is running from inside a Homebrew Cellar (".../Cellar/lopen/"),
+        OR HOMEBREW_PREFIX is set and our script dir lives under it.
+    Otherwise the classic ~/.lopen launchd-agent layout is assumed.
+    """
+    if env.get("LOPEN_LIBEXEC"):
+        return "brew"
+    if "/Cellar/lopen/" in script_dir:
+        return "brew"
+    prefix = env.get("HOMEBREW_PREFIX")
+    if prefix and (script_dir == prefix
+                   or script_dir.startswith(prefix.rstrip("/") + "/")):
+        return "brew"
+    return "launchd"
+
+
+def service_mode():
+    return detect_service_mode(_script_dir(), os.environ)
+
+
+def resolve_log_file(env, mode):
+    """Return the daemon log path for the given env dict + service mode (pure).
+
+    LOPEN_LOG wins if set; else brew mode logs under $HOMEBREW_PREFIX/var/log;
+    else the classic ~/.lopen/lopend.log.
+    """
+    if env.get("LOPEN_LOG"):
+        return env["LOPEN_LOG"]
+    if mode == "brew":
+        prefix = env.get("HOMEBREW_PREFIX", "/opt/homebrew")
+        return os.path.join(prefix, "var", "log", "lopen.log")
+    return os.path.join(LOPEN_HOME, "lopend.log")
+
+
+def log_file():
+    return resolve_log_file(os.environ, service_mode())
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +301,16 @@ def plist_contents(python_path, lopend_path):
 
 
 def cmd_install(args):
-    """Install/refresh the daemon and (re)load the launchd agent. Idempotent."""
+    """Install/refresh the daemon and (re)load the launchd agent. Idempotent.
+
+    In Homebrew mode the daemon lives in the formula's libexec and is managed by
+    `brew services`, so there is nothing to install here - we just point the user
+    at `brew services start lopen` and skip writing a launchd plist."""
+    if service_mode() == "brew":
+        print("Homebrew install detected: the daemon is managed by brew services.")
+        print("Start it with:  brew services start lopen")
+        return 0
+
     os.makedirs(LOPEN_HOME, exist_ok=True)
     os.makedirs(os.path.dirname(PLIST), exist_ok=True)
 
@@ -297,7 +358,36 @@ def _launchctl_loaded():
     return any(LABEL in line for line in out.splitlines())
 
 
+def _brew_services(action):
+    """Run `brew services <action> lopen`. Returns the CompletedProcess, or None
+    if `brew` isn't on PATH."""
+    if not which("brew"):
+        print("error: `brew` not found on PATH.", file=sys.stderr)
+        return None
+    return run(["brew", "services", action, "lopen"])
+
+
+def _brew_started():
+    """True if `brew services list` reports lopen as started."""
+    r = run(["brew", "services", "list"])
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0] == "lopen":
+            return "started" in parts
+    return False
+
+
 def cmd_start(args):
+    if service_mode() == "brew":
+        print("Service mode: brew")
+        r = _brew_services("start")
+        if r is None or r.returncode != 0:
+            print("failed to start lopen via brew services", file=sys.stderr)
+            return 1
+        sys.stdout.write(r.stdout)
+        return 0
+
+    print("Service mode: launchd")
     if not os.path.exists(PLIST):
         print("Not installed. Run: lopen install", file=sys.stderr)
         return 1
@@ -311,6 +401,16 @@ def cmd_start(args):
 
 
 def cmd_stop(args):
+    if service_mode() == "brew":
+        print("Service mode: brew")
+        r = _brew_services("stop")
+        if r is None or r.returncode != 0:
+            print("failed to stop lopen via brew services", file=sys.stderr)
+            return 1
+        sys.stdout.write(r.stdout)
+        return 0
+
+    print("Service mode: launchd")
     r = run(["launchctl", "unload", PLIST])
     if r.returncode != 0:
         print("failed to stop %s: %s" % (LABEL, r.stderr.strip()),
@@ -321,6 +421,16 @@ def cmd_stop(args):
 
 
 def cmd_restart(args):
+    if service_mode() == "brew":
+        print("Service mode: brew")
+        r = _brew_services("restart")
+        if r is None or r.returncode != 0:
+            print("failed to restart lopen via brew services", file=sys.stderr)
+            return 1
+        sys.stdout.write(r.stdout)
+        return 0
+
+    print("Service mode: launchd")
     # kickstart -k restarts if loaded; fall back to unload/load.
     uid = os.getuid()
     ks = run(["launchctl", "kickstart", "-k", "gui/%d/%s" % (uid, LABEL)])
@@ -338,6 +448,16 @@ def cmd_restart(args):
 
 
 def cmd_status(args):
+    if service_mode() == "brew":
+        print("Service mode: brew")
+        if not which("brew"):
+            print("error: `brew` not found on PATH.", file=sys.stderr)
+            return 1
+        r = run(["brew", "services", "info", "lopen"])
+        sys.stdout.write(r.stdout)
+        return 0 if _brew_started() else 1
+
+    print("Service mode: launchd")
     if _launchctl_loaded():
         print("%s loaded." % LABEL)
         print(run(["launchctl", "list", LABEL]).stdout.rstrip())
@@ -347,17 +467,18 @@ def cmd_status(args):
 
 
 def cmd_logs(args):
-    if not os.path.exists(LOG_FILE):
-        print("No log at %s yet." % LOG_FILE, file=sys.stderr)
+    path = log_file()
+    if not os.path.exists(path):
+        print("No log at %s yet." % path, file=sys.stderr)
         return 1
     if args.follow:
         try:
-            os.execvp("tail", ["tail", "-f", LOG_FILE])
+            os.execvp("tail", ["tail", "-f", path])
         except OSError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 1
     else:
-        with open(LOG_FILE, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             sys.stdout.write(fh.read())
     return 0
 
@@ -491,23 +612,31 @@ def cmd_doctor(args):
         check(p is not None, tool, p or "NOT FOUND")
 
     print("\n=== daemon ===")
-    loaded = _launchctl_loaded()
-    check(loaded, "launchd agent %s loaded" % LABEL,
-          "run 'lopen install' if missing" if not loaded else "")
+    mode = service_mode()
+    print("  service mode: %s" % mode)
+    if mode == "brew":
+        started = _brew_started() if which("brew") else False
+        check(started, "brew service lopen started",
+              "run 'brew services start lopen'" if not started else "")
+    else:
+        loaded = _launchctl_loaded()
+        check(loaded, "launchd agent %s loaded" % LABEL,
+              "run 'lopen install' if missing" if not loaded else "")
 
-    if os.path.exists(LOG_FILE):
+    log_path = log_file()
+    if os.path.exists(log_path):
         last = ""
         try:
-            with open(LOG_FILE, encoding="utf-8") as fh:
+            with open(log_path, encoding="utf-8") as fh:
                 lines = fh.read().splitlines()
                 last = lines[-1] if lines else ""
         except OSError:
             pass
-        check(True, "log file present", "%s" % LOG_FILE)
+        check(True, "log file present", "%s" % log_path)
         if last:
             print("    last: %s" % last)
     else:
-        check(False, "log file present", "%s (daemon hasn't run yet?)" % LOG_FILE)
+        check(False, "log file present", "%s (daemon hasn't run yet?)" % log_path)
 
     print("\n=== configured hosts ===")
     hosts = hosts_list()

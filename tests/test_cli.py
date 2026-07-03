@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import tempfile
 import unittest
 
 # The CLI is a single-file script named `lopen` (no .py extension), so load it
@@ -132,6 +133,88 @@ class TestDecodeLopen1(unittest.TestCase):
         body = s[len("LOPEN1:"):]
         mangled = "LOPEN1:" + body[:5] + "\n" + body[5:]
         self.assertEqual(cli.decode_lopen1(mangled)["host"], "h")
+
+
+class TestFindFileLibexec(unittest.TestCase):
+    def test_lopen_libexec_wins(self):
+        # A fake lopend.py in $LOPEN_LIBEXEC must be found first.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "lopend.py")
+            with open(fake, "w", encoding="utf-8") as fh:
+                fh.write("# fake\n")
+            old = os.environ.get("LOPEN_LIBEXEC")
+            os.environ["LOPEN_LIBEXEC"] = tmp
+            try:
+                self.assertEqual(cli.find_lopend(), os.path.abspath(fake))
+            finally:
+                if old is None:
+                    del os.environ["LOPEN_LIBEXEC"]
+                else:
+                    os.environ["LOPEN_LIBEXEC"] = old
+
+
+class TestDetectServiceMode(unittest.TestCase):
+    def test_brew_when_libexec_env(self):
+        self.assertEqual(
+            cli.detect_service_mode("/anywhere", {"LOPEN_LIBEXEC": "/x"}), "brew"
+        )
+
+    def test_brew_when_script_under_homebrew_prefix(self):
+        self.assertEqual(
+            cli.detect_service_mode(
+                "/opt/homebrew/bin", {"HOMEBREW_PREFIX": "/opt/homebrew"}
+            ),
+            "brew",
+        )
+
+    def test_brew_when_in_cellar(self):
+        self.assertEqual(
+            cli.detect_service_mode(
+                "/opt/homebrew/Cellar/lopen/0.1.0/libexec", {}
+            ),
+            "brew",
+        )
+
+    def test_launchd_otherwise(self):
+        self.assertEqual(
+            cli.detect_service_mode("/Users/me/.lopen", {}), "launchd"
+        )
+        # HOMEBREW_PREFIX set but script dir NOT under it -> launchd.
+        self.assertEqual(
+            cli.detect_service_mode(
+                "/Users/me/.lopen", {"HOMEBREW_PREFIX": "/opt/homebrew"}
+            ),
+            "launchd",
+        )
+
+
+class TestResolveLogFile(unittest.TestCase):
+    def test_lopen_log_env_wins(self):
+        self.assertEqual(
+            cli.resolve_log_file({"LOPEN_LOG": "/tmp/x.log"}, "brew"),
+            "/tmp/x.log",
+        )
+        self.assertEqual(
+            cli.resolve_log_file({"LOPEN_LOG": "/tmp/x.log"}, "launchd"),
+            "/tmp/x.log",
+        )
+
+    def test_brew_uses_homebrew_prefix_var_log(self):
+        self.assertEqual(
+            cli.resolve_log_file({"HOMEBREW_PREFIX": "/opt/homebrew"}, "brew"),
+            "/opt/homebrew/var/log/lopen.log",
+        )
+
+    def test_brew_default_prefix(self):
+        self.assertEqual(
+            cli.resolve_log_file({}, "brew"), "/opt/homebrew/var/log/lopen.log"
+        )
+
+    def test_launchd_uses_lopen_home(self):
+        self.assertEqual(
+            cli.resolve_log_file({}, "launchd"),
+            os.path.join(cli.LOPEN_HOME, "lopend.log"),
+        )
 
 
 if __name__ == "__main__":

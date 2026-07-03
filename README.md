@@ -15,6 +15,18 @@ file down, and runs macOS `open` on the local copy. By default the remote
 command then **blocks** until the local open finishes (a small back-channel over
 ssh), so `lopen` behaves like a normal blocking command.
 
+**Why lopen:**
+
+- **No admin/root required** — installs entirely in userland (Homebrew or a
+  plain script); the remote side is a single script dropped in your `~/bin`.
+- **No SSHFS, no FUSE, no file server, no reverse tunnel** — nothing to mount,
+  nothing to daemonize on the remote.
+- **Only dependency: your terminal's OSC 52 clipboard support** — which most
+  modern terminals already have. If copy/paste over OSC 52 works, lopen works.
+
+(It does need passwordless ssh from your Mac to the host, and a small local
+daemon running on your Mac — both covered below.)
+
 ## Quickstart
 
 ```sh
@@ -29,10 +41,10 @@ lopen report.pdf                # opens on your Mac
 
 ## Requirements
 
-- **Local:** macOS, with the built-in `python3`, `pbpaste`, `open`, `scp`, `ssh` (all present by default). No third-party packages — the daemon and CLI are Python 3 standard library only.
+- **Terminal (the core requirement):** an OSC 52-capable terminal on your Mac (iTerm2, WezTerm, kitty, Alacritty, …). If your terminal can copy to the clipboard over OSC 52, lopen works. Terminal.app is NOT supported — see [Terminal requirements](#terminal-requirements).
+- **Local:** macOS, with the built-in `python3`, `pbpaste`, `open`, `scp`, `ssh` (all present by default). No third-party packages — the daemon and CLI are Python 3 standard library only. Homebrew is optional (the script installer needs no admin either).
 - **Remote:** any Linux/Unix host with `bash`, `base64`, and `coreutils` (`realpath`/`stat`). No runtime to install — `lopen` is a single self-contained bash script.
 - **Connectivity:** passwordless ssh from your Mac to the remote host (the daemon uses `BatchMode=yes` for both the file `scp` and the blocking back-channel).
-- **Terminal:** an OSC 52-capable terminal on your Mac (iTerm2, WezTerm, kitty, Alacritty, …). Terminal.app is NOT supported — see [Terminal requirements](#terminal-requirements).
 
 ## Architecture
 
@@ -54,7 +66,20 @@ Protocol version: **LOPEN1** (optional `wait` field enables the back-channel).
 
 ## Install
 
-### Local (your Mac) — do this first
+### Local (your Mac) — Homebrew (recommended)
+
+```sh
+brew install jaxonwang/tap/lopen     # once the tap repo exists
+# or, right now, straight from the formula in this repo:
+brew install https://raw.githubusercontent.com/jaxonwang/lopen/main/Formula/lopen.rb
+brew services start lopen
+```
+
+With Homebrew you manage the daemon via `brew services start|stop lopen`. The
+`lopen start/stop/status/restart` subcommands auto-detect brew mode and delegate
+to `brew services`, so they work either way.
+
+### Local (your Mac) — from source (no Homebrew)
 
 ```sh
 ./install/install-local.sh
@@ -64,7 +89,7 @@ This installs three files under `~/.lopen/` (the `lopend` daemon, the `lopen`
 management CLI, and a copy of the remote script), symlinks the CLI to
 `~/bin/lopen`, and loads a launchd agent (`com.lopen.lopend`) that runs the
 daemon now and on every login. If `~/bin` isn't on your `PATH`, the installer
-tells you how to add it.
+tells you how to add it. No admin/root required.
 
 ### Remote (the Linux host you ssh into) — via `lopen setup`
 
