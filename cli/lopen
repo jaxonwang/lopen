@@ -570,7 +570,7 @@ def cmd_setup(args):
                     *ssh_opts, "--", ssh_host, remote_cmd], **kw)
 
     # 1. Ensure remote dir, then scp the script into place + chmod.
-    mk = ssh("mkdir -p %s" % _shq(remote_dir))
+    mk = ssh("mkdir -p %s" % _shq_path(remote_dir))
     if mk.returncode != 0:
         print("%s could not ssh / mkdir on remote: %s"
               % (CROSS, mk.stderr.strip()), file=sys.stderr)
@@ -583,7 +583,7 @@ def cmd_setup(args):
         print("%s scp of lopen failed: %s" % (CROSS, scp.stderr.strip()),
               file=sys.stderr)
         return 1
-    ch = ssh("chmod +x %s" % _shq(remote_target))
+    ch = ssh("chmod +x %s" % _shq_path(remote_target))
     if ch.returncode != 0:
         print("%s could not chmod +x remote lopen: %s"
               % (CROSS, ch.stderr.strip()), file=sys.stderr)
@@ -607,7 +607,7 @@ def cmd_setup(args):
 
     # 4. Verify: run remote lopen --print and check host matches config. Probe
     # "/" since it always exists and is readable (unlike, say, /etc/hostname).
-    verify = ssh("%s --print /" % _shq(remote_target))
+    verify = ssh("%s --print /" % _shq_path(remote_target))
     if verify.returncode != 0:
         print("%s verification run failed: %s" % (CROSS, verify.stderr.strip()),
               file=sys.stderr)
@@ -643,10 +643,19 @@ def _record_host(ssh_host):
         fh.write(updated)
 
 
-def _shq(s):
-    """Minimal shell-quote for building remote command strings."""
+def _shq_path(s):
+    """Shell-quote a remote path, but preserve a leading ~ or ~user prefix so the
+    remote shell still performs tilde expansion. Only a strictly safe tilde prefix
+    (~ or ~[A-Za-z0-9_-]) is left unquoted; anything else is fully quoted (no
+    expansion, but injection-safe). The path body after the tilde is shlex-quoted,
+    so spaces/metachars in it stay safe."""
     import shlex
-    return shlex.quote(s)
+    import re
+    m = re.match(r'\A(~[A-Za-z0-9_-]*)(/.*)?\Z', s)
+    if not m:
+        return shlex.quote(s)
+    prefix, rest = m.group(1), m.group(2) or ''
+    return prefix + (shlex.quote(rest) if rest else '')
 
 
 # --------------------------------------------------------------------------- #

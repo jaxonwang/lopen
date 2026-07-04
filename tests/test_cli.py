@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import tempfile
 import unittest
 
@@ -258,6 +259,73 @@ class TestResolveLogFile(unittest.TestCase):
             cli.resolve_log_file({}, "launchd"),
             os.path.join(cli.LOPEN_HOME, "lopend.log"),
         )
+
+
+class TestShqPath(unittest.TestCase):
+    def test_tilde_home_preserved(self):
+        self.assertEqual(cli._shq_path("~/bin"), "~/bin")
+
+    def test_tilde_home_nested_preserved(self):
+        self.assertEqual(cli._shq_path("~/bin/lopen"), "~/bin/lopen")
+
+    def test_tilde_user_preserved(self):
+        self.assertEqual(cli._shq_path("~user/bin"), "~user/bin")
+
+    def test_absolute_path_unquoted(self):
+        # shlex.quote leaves a metachar-free absolute path unquoted.
+        self.assertEqual(cli._shq_path("/abs/path"), "/abs/path")
+
+    def test_tilde_with_space_quotes_body(self):
+        # Tilde prefix preserved, but the space in the body must be quoted.
+        result = cli._shq_path("~/my dir")
+        self.assertTrue(result.startswith("~"))
+        self.assertNotEqual(result, "~/my dir")
+        self.assertEqual(result, "~" + shlex.quote("/my dir"))
+
+    def test_injection_semicolon_fully_quoted(self):
+        # "~;rm -rf x" does not match the safe tilde prefix (";" breaks the
+        # charset and there's no following "/"), so it falls to full quoting;
+        # the shell sees a literal, harmless string.
+        result = cli._shq_path("~;rm -rf x")
+        self.assertEqual(result, shlex.quote("~;rm -rf x"))
+        # The ";" must be inside quotes (not exposed to the shell), so the
+        # result is wrapped in single quotes rather than an unquoted prefix.
+        self.assertTrue(result.startswith("'") and result.endswith("'"))
+
+    def test_injection_command_substitution_fully_quoted(self):
+        self.assertEqual(
+            cli._shq_path("~$(whoami)/x"), shlex.quote("~$(whoami)/x")
+        )
+
+    def test_bare_tilde(self):
+        # No slash, no rest -> rest-is-None branch, prefix returned as-is.
+        self.assertEqual(cli._shq_path("~"), "~")
+
+    def test_tilde_user_no_slash(self):
+        # ~user with no path body -> rest-is-None branch.
+        self.assertEqual(cli._shq_path("~user"), "~user")
+
+    def test_backtick_body_quoted(self):
+        result = cli._shq_path("~/foo`whoami`")
+        self.assertTrue(result.startswith("~"))
+        self.assertEqual(result, "~" + shlex.quote("/foo`whoami`"))
+
+    def test_single_quote_body_quoted(self):
+        result = cli._shq_path("~/'; evil")
+        self.assertTrue(result.startswith("~"))
+        self.assertEqual(result, "~" + shlex.quote("/'; evil"))
+
+    def test_trailing_newline_falls_through(self):
+        # \Z (not $) anchors true end-of-string, so a trailing newline must NOT
+        # match the tilde prefix; it falls to full quoting and is preserved.
+        self.assertEqual(cli._shq_path("~/x\n"), shlex.quote("~/x\n"))
+        self.assertNotEqual(cli._shq_path("~/x\n"), "~/x\n")
+
+    def test_embedded_newline_falls_through(self):
+        self.assertEqual(cli._shq_path("~/x\nevil"), shlex.quote("~/x\nevil"))
+
+    def test_space_in_prefix_falls_through(self):
+        self.assertEqual(cli._shq_path("~foo bar"), shlex.quote("~foo bar"))
 
 
 if __name__ == "__main__":
