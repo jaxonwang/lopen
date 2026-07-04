@@ -2,7 +2,7 @@ class Lopen < Formula
   desc "Open remote files and directories on your local Mac from an SSH session"
   homepage "https://github.com/jaxonwang/lopen"
   url "https://github.com/jaxonwang/lopen/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "PLACEHOLDER_SHA256_FILLED_AT_RELEASE"
+  sha256 "1e60af5e29505dbeb3ab2a207f411f2f04c95c0658fd608e0400f54a54009f49"
   license "MIT"
 
   depends_on :macos
@@ -23,13 +23,13 @@ class Lopen < Formula
       #!/bin/bash
       export LOPEN_LIBEXEC="#{libexec}"
       export HOMEBREW_PREFIX="#{HOMEBREW_PREFIX}"
-      exec "#{formula_opt_bin("python@3.12")}/python3" "#{libexec}/lopen" "$@"
+      exec "#{formula_opt_bin("python@3.12")}/python3.12" "#{libexec}/lopen" "$@"
     EOS
     chmod 0755, bin/"lopen"
   end
 
   service do
-    run [formula_opt_bin("python@3.12")/"python3", opt_libexec/"lopend.py"]
+    run [formula_opt_bin("python@3.12")/"python3.12", opt_libexec/"lopend.py"]
     keep_alive true
     log_path var/"log/lopen.log"
     error_log_path var/"log/lopen.log"
