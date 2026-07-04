@@ -42,7 +42,7 @@ lopen report.pdf                # opens on your Mac
 ## Requirements
 
 - **Terminal (the core requirement):** an OSC 52-capable terminal on your Mac (iTerm2, WezTerm, kitty, Alacritty, …). If your terminal can copy to the clipboard over OSC 52, lopen works. Terminal.app is NOT supported — see [Terminal requirements](#terminal-requirements).
-- **Local:** macOS, with the built-in `python3`, `pbpaste`, `open`, `scp`, `ssh` (all present by default). No third-party packages — the daemon and CLI are Python 3 standard library only. Homebrew is optional (the script installer needs no admin either).
+- **Local:** macOS, with `pbpaste`, `open`, `scp`, `ssh` (all present by default) and Python 3. No third-party packages — the daemon and CLI are Python 3 standard library only. The Homebrew install pulls in `python@3.12`; the source installer uses the built-in `python3`. Homebrew is optional (the script installer needs no admin either).
 - **Remote:** any Linux/Unix host with `bash`, `base64`, and `coreutils` (`realpath`/`stat`). Inline delivery (see [Recursive ssh](#recursive-ssh-multi-hop)) additionally uses `gzip` (and `tar` for directories); if missing, lopen falls back to scp. No runtime to install — `lopen` is a single self-contained bash script.
 - **Connectivity:** passwordless ssh from your Mac to the remote host for the scp fetch and the blocking back-channel (the daemon uses `BatchMode=yes`). **Inline mode needs no such connectivity** — small files/dirs ride the clipboard through any number of ssh hops. For multi-hop scp, see [Recursive ssh (multi-hop)](#recursive-ssh-multi-hop).
 
@@ -69,8 +69,8 @@ Protocol version: **LOPEN1** (optional `wait` field enables the back-channel).
 ### Local (your Mac) — Homebrew (recommended)
 
 ```sh
-brew install jaxonwang/tap/lopen     # once the tap repo exists
-# or, right now, straight from the formula in this repo:
+brew install jaxonwang/tap/lopen
+# or, without adding the tap, straight from the formula in this repo:
 brew install https://raw.githubusercontent.com/jaxonwang/lopen/main/Formula/lopen.rb
 brew services start lopen
 ```
