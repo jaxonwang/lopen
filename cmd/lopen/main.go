@@ -17,8 +17,9 @@ func main() {
 	flag.BoolVar(&o.Force, "force", false, "overwrite a locally-modified mirror copy / exceed the size cap")
 	flag.BoolVar(&o.Reveal, "reveal", false, "reveal in Finder instead of opening")
 	flag.StringVar(&o.App, "a", "", "open with a specific macOS application")
-	flag.StringVar(&o.Label, "label", "", "origin label (default: short hostname)")
-	flag.StringVar(&o.Socket, "socket", "", "unix socket path (default: ~/.lopen/lopen.sock)")
+	flag.StringVar(&o.Label, "label", "", "origin label (default: from agent config)")
+	flag.StringVar(&o.Agent, "agent", "", "agent config path (default: ~/.lopen/agent.json)")
+	flag.StringVar(&o.Addr, "addr", "", "daemon address host:port (default: from agent config)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `usage: lopen [flags] <path>
 

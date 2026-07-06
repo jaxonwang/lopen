@@ -30,6 +30,7 @@ type Server struct {
 
 	Mir     *mirror.Mirror
 	tunnels map[string]*Tunnel
+	tokens  *tokenStore
 
 	// OpenCommand overrides /usr/bin/open (tests / linux dev).
 	OpenCommand string
@@ -93,11 +94,16 @@ func NewServer(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	tokens, err := loadTokens(cfg.TokensPath())
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		Cfg:            cfg,
 		Log:            log,
 		Mir:            &mirror.Mirror{Root: cfg.MirrorDir, Idx: idx},
 		tunnels:        map[string]*Tunnel{},
+		tokens:         tokens,
 		requestTimeout: 10 * time.Minute,
 		sem:            make(chan struct{}, maxConcurrentRequests),
 	}, nil
@@ -131,7 +137,11 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("host %s: %w", h.Label, err)
 		}
-		t := &Tunnel{Host: h, LocalSock: sock, Log: s.Log}
+		token, err := s.tokens.ensure(h.Label)
+		if err != nil {
+			return fmt.Errorf("host %s: %w", h.Label, err)
+		}
+		t := &Tunnel{Host: h, LocalSock: sock, Token: token, Log: s.Log}
 		s.tunnels[h.Label] = t
 		bounds = append(bounds, bound{t: t, ln: ln})
 	}
@@ -251,6 +261,14 @@ func (s *Server) handle(ctx context.Context, conn net.Conn, t *Tunnel) error {
 	}
 	if req.Origin.Label != tunnelLabel {
 		return fail(fmt.Errorf("origin %q does not match tunnel host %q", req.Origin.Label, tunnelLabel))
+	}
+
+	// The remote transport is a loopback TCP port any local user on the remote
+	// host can connect to, so socket file mode no longer gates access. Require
+	// the per-host token, which only a client that can read the 0600 remote
+	// agent config can supply.
+	if !s.tokens.valid(tunnelLabel, req.Token) {
+		return fail(fmt.Errorf("authentication failed for host %q", tunnelLabel))
 	}
 
 	rel, err := mirror.Rel(req.Origin.Label, req.Path)
