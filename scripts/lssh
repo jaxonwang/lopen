@@ -1,0 +1,31 @@
+#!/bin/sh
+# lssh - ssh one hop deeper while extending the lopen socket chain.
+#
+# Usage: lssh <ssh args...>       (exactly like ssh)
+#
+# It forwards ~/.lopen/lopen.sock on the TARGET to ~/.lopen/lopen.sock HERE,
+# so `lopen` keeps working on the far side. Before connecting it removes the
+# stale socket on the target: sshd refuses to bind over an existing socket
+# file unless the remote sshd_config sets StreamLocalBindUnlink, which we
+# cannot change without root.
+#
+# The last argument that does not look like an option is assumed to be the
+# destination (good enough for `lssh host` / `lssh user@host`; for exotic ssh
+# invocations run the rm yourself).
+set -eu
+
+SOCK=".lopen/lopen.sock"
+
+dest=""
+for arg in "$@"; do
+    case "$arg" in
+        -*) ;;
+        *) dest="$arg" ;;
+    esac
+done
+
+if [ -n "$dest" ]; then
+    ssh -o BatchMode=yes -- "$dest" "rm -f -- $SOCK && mkdir -p .lopen" 2>/dev/null || true
+fi
+
+exec ssh -R "$SOCK:$HOME/$SOCK" "$@"
