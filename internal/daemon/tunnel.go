@@ -51,6 +51,16 @@ func (t *Tunnel) controlPath(ctlDir string) string {
 	return filepath.Join(ctlDir, t.Host.Label+".ctl")
 }
 
+// controlPathOpt formats the ControlPath option value. ssh parses a `-o
+// key=value` argument like a config-file line and splits value on whitespace,
+// so a path containing a space (the default macOS state dir lives under
+// "~/Library/Application Support") must be double-quoted or ssh errors with
+// "keyword controlpath extra arguments at end of line". The path cannot
+// itself contain a double quote: it is derived from ctlDir + a validated label.
+func (t *Tunnel) controlPathOpt(ctlDir string) string {
+	return `ControlPath="` + t.controlPath(ctlDir) + `"`
+}
+
 // connArgs are the safety-critical ssh options common to every connection.
 // Host.Dest is validated against destRe at config load, and "--" precedes it
 // everywhere, so it can never be parsed as an option.
@@ -74,7 +84,7 @@ func (t *Tunnel) connArgs() []string {
 func (t *Tunnel) masterArgs(ctlDir string) []string {
 	return append(t.connArgs(),
 		"-o", "ControlMaster=yes",
-		"-o", "ControlPath="+t.controlPath(ctlDir),
+		"-o", t.controlPathOpt(ctlDir),
 	)
 }
 
@@ -83,7 +93,7 @@ func (t *Tunnel) masterArgs(ctlDir string) []string {
 func (t *Tunnel) clientArgs(ctlDir string) []string {
 	return append(t.connArgs(),
 		"-o", "ControlMaster=no",
-		"-o", "ControlPath="+t.controlPath(ctlDir),
+		"-o", t.controlPathOpt(ctlDir),
 	)
 }
 
