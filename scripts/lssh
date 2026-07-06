@@ -1,20 +1,37 @@
 #!/bin/sh
-# lssh - ssh one hop deeper while extending the lopen socket chain.
+# lssh - ssh one hop deeper while extending the lopen tunnel.
 #
 # Usage: lssh <ssh args...>       (exactly like ssh)
 #
-# It forwards ~/.lopen/lopen.sock on the TARGET to ~/.lopen/lopen.sock HERE,
-# so `lopen` keeps working on the far side. Before connecting it removes the
-# stale socket on the target: sshd refuses to bind over an existing socket
-# file unless the remote sshd_config sets StreamLocalBindUnlink, which we
-# cannot change without root.
+# lopen's reverse tunnel terminates in a loopback TCP port on THIS host
+# (127.0.0.1:<port>, read from ~/.lopen/agent.json). lssh extends the chain to
+# the next hop by:
+#   1. copying this host's ~/.lopen/agent.json to the target (so `lopen` there
+#      learns the same label/port/token), and
+#   2. forwarding the target's 127.0.0.1:<port> back to this host's port with
+#      `ssh -R`.
+#
+# The request from the far side then relays hop-by-hop back to your Mac and is
+# attributed to the nearest directly-enrolled host's label — the honest
+# identity the daemon can attest to.
 #
 # The last argument that does not look like an option is assumed to be the
 # destination (good enough for `lssh host` / `lssh user@host`; for exotic ssh
-# invocations run the rm yourself).
+# invocations forward the port yourself).
 set -eu
 
-SOCK=".lopen/lopen.sock"
+AGENT="$HOME/.lopen/agent.json"
+if [ ! -f "$AGENT" ]; then
+    echo "lssh: no agent config at $AGENT; is the lopen tunnel to this host up?" >&2
+    exit 1
+fi
+
+# Extract the port from the JSON agent config without requiring jq.
+PORT=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$AGENT")
+if [ -z "$PORT" ]; then
+    echo "lssh: could not read port from $AGENT" >&2
+    exit 1
+fi
 
 dest=""
 for arg in "$@"; do
@@ -25,7 +42,11 @@ for arg in "$@"; do
 done
 
 if [ -n "$dest" ]; then
-    ssh -o BatchMode=yes -- "$dest" "rm -f -- $SOCK && mkdir -p .lopen" 2>/dev/null || true
+    # Copy this host's agent config to the target so `lopen` there authenticates
+    # with the same token, then loopback-forward the port on connect.
+    ssh -o BatchMode=yes -- "$dest" \
+        'umask 077 && mkdir -p ~/.lopen && chmod 700 ~/.lopen && cat > ~/.lopen/agent.json.tmp && chmod 600 ~/.lopen/agent.json.tmp && mv -f ~/.lopen/agent.json.tmp ~/.lopen/agent.json' \
+        < "$AGENT" 2>/dev/null || true
 fi
 
-exec ssh -R "$SOCK:$HOME/$SOCK" "$@"
+exec ssh -o ExitOnForwardFailure=yes -R "127.0.0.1:$PORT:127.0.0.1:$PORT" "$@"

@@ -28,9 +28,9 @@ session**:
 ```
 ┌─ your Mac ─────────────────────────────┐        ┌─ dev host ────────────────┐
 │ lopend (launchd agent, always running) │        │                           │
-│  • holds a persistent ssh -N -R reverse│  ssh   │  ~/.lopen/lopen.sock       │
-│    UNIX-socket tunnel to each host  ────┼────────┼─►  (created by sshd)       │
-│  • listens on a per-host local socket  │        │                           │
+│  • holds a persistent ssh -N -R reverse│  ssh   │  127.0.0.1:47654           │
+│    TCP-to-local-socket tunnel per host ─┼────────┼─►  (bound by sshd)         │
+│  • listens on a per-host local socket  │        │  ~/.lopen/agent.json 0600  │
 │  • receives the file bytes inline      │◄───────┼── lopen report.pdf         │
 │  • writes ~/lopen/<host>/<path>        │        │    (sends request + bytes) │
 │  • runs `open`, replies "opened" ──────┼────────┼─►  (unblocks)              │
@@ -42,27 +42,40 @@ your laptop (which corp VPN/NAT usually forbids anyway). Because the tunnel is
 a separate connection from your mosh/tmux session, mosh on the first hop is
 fully supported.
 
+**Why a loopback TCP port, not a remote UNIX socket?** Amazon-managed sshd
+refuses UNIX-domain reverse forwards (`AllowStreamLocalForwarding` is off, and
+you can't change it without root), but it permits forwarding a remote TCP port
+to a local UNIX socket. So the daemon binds `127.0.0.1:<port>` on the remote
+(never `0.0.0.0` — the listener is not network-reachable) and bridges it to its
+own local socket. A loopback port is reachable by *any local user* on that
+host, so access is gated by a per-host **token**: the daemon provisions
+`~/.lopen/agent.json` (mode 0600, holding `{label, port, token}`) over the ssh
+connection it already holds, and `lopen` must present that token. Only a process
+that can read your 0600 file can push to your Mac.
+
 **Transfer is inline over ssh.** `lopen` streams the file's bytes back through
-the forwarded socket, so the daemon never needs to `scp`/`rsync` *back* to the
+the forwarded port, so the daemon never needs to `scp`/`rsync` *back* to the
 host — it only needs the connection the Mac already opened. That's what makes
 chained hops into unreachable private networks work.
 
 ## Recursive / chained ssh (private networks, no ProxyJump)
 
-For `Mac → A → B → C` where C is only reachable from B, extend the socket one
+For `Mac → A → B → C` where C is only reachable from B, extend the tunnel one
 hop at a time with the bundled `lssh` wrapper instead of `ssh` for inner hops:
 
 ```sh
 # on your Mac: lopend already tunnels to A
-lssh B      # from A — forwards the socket to B
+lssh B      # from A — forwards the port to B, copies the agent config
 lssh C      # from B — forwards it to C
 lopen file  # on C — relays C→B→A→Mac; opens on your Mac
 ```
 
-`lssh` is just `ssh` plus `-R ~/.lopen/lopen.sock:~/.lopen/lopen.sock` and a
-stale-socket pre-clean. If you forget it on a hop, `lopen` fails fast telling
-you which hop to reconnect. (Limitation: a *mid-chain* mosh hop can't carry
-the forward — mosh as the **first** hop is fine, which is the common case.)
+`lssh` is `ssh` plus `-R 127.0.0.1:<port>:127.0.0.1:<port>` (the port it reads
+from `~/.lopen/agent.json`) and a copy of that agent config to the next hop so
+`lopen` there authenticates with the same token. If you forget it on a hop,
+`lopen` fails fast telling you which hop to reconnect. (Limitation: a *mid-chain*
+mosh hop can't carry the forward — mosh as the **first** hop is fine, which is
+the common case.)
 
 ## Install
 
@@ -88,7 +101,7 @@ Everything is userland — **no admin/root on either side**.
 {
   "hosts": [
     { "label": "devbox", "dest": "dev-dsk-me.us-west-2.amazon.com" },
-    { "label": "prod-jump", "dest": "me@jump.example.com", "keep": true }
+    { "label": "prod-jump", "dest": "me@jump.example.com", "keep": true, "remote_port": 47655 }
   ],
   "ttl_days": 7,
   "max_mirror_bytes": 2147483648,
@@ -100,6 +113,9 @@ Everything is userland — **no admin/root on either side**.
   `~/lopen/<label>/…` and the per-host socket. A request may only claim the
   label of the tunnel it arrived on, so one host cannot masquerade as another.
 - `dest` — the ssh destination (may be an `~/.ssh/config` alias).
+- `remote_port` — the loopback TCP port bound on that remote host (default
+  `47654`). Only matters if another local user on the same host already binds
+  it; give each such host a distinct port.
 - `keep` — pin this host's mirror so GC never evicts it.
 
 Defaults: **7-day TTL, 2 GiB mirror cap, 500 MiB per-file cap.**
@@ -132,24 +148,33 @@ rsync's default), not a security mechanism; `--force` always overrides.
 
 ## Security model
 
-- **No network listeners** on either side — UNIX sockets only, mode 0600
-  inside 0700 directories.
-- Every request field is treated as **untrusted** (any host on the ssh chain
-  can write to the forwarded socket). The daemon validates the protocol
-  version, op, mode, origin label, and path; rejects non-absolute paths,
-  control characters, and traversal; confines every write under
-  `~/lopen/<label>/`.
+- **On your Mac, no network listeners** — the daemon accepts only on per-host
+  UNIX sockets, mode 0600 inside 0700 directories.
+- **On the remote, a loopback-only TCP port** (`127.0.0.1:<port>`, never
+  `0.0.0.0`) bridged to that socket by sshd. Because any local user on the
+  remote can connect to a loopback port, every request must carry a **per-host
+  token**. The daemon provisions it in `~/.lopen/agent.json` (mode 0600) and
+  compares presented tokens in constant time; a wrong or missing token is
+  rejected before any payload is read. The 0600 mode on that file is what keeps
+  another local user from learning the token.
+- Every request field is treated as **untrusted** (any host on the ssh chain,
+  and any local user who holds the token, can write to the forwarded port). The
+  daemon validates the protocol version, op, mode, origin label, and path;
+  rejects non-absolute paths, control characters, and traversal; confines every
+  write under `~/lopen/<label>/`.
 - Tar streams for directories never materialize symlinks/hardlinks/devices,
   reject `..`/absolute entry names, and are bounded by a byte budget and
   entry-count cap so a small hostile archive can't fill your disk.
-- Commands are invoked by **argv, never a shell**; the only value interpolated
-  into a remote shell command (pull mode) is single-quoted. ssh destinations
-  are validated and always follow `--`.
+- Commands are invoked by **argv, never a shell**; the only values interpolated
+  into a remote shell command (agent-config provisioning, pull mode) are
+  single-quoted and daemon-controlled. ssh destinations are validated and always
+  follow `--`.
 - **Trust statement:** you are trusting the chain of hosts you ssh through
-  (each can read/inject on the forwarded socket — inherent to forwarding). The
-  worst a compromised trusted host can do is make your Mac open a file *it*
-  supplied, attributed to *its own* label. It cannot escape the mirror, run
-  commands, or impersonate another host.
+  (each can read/inject on the forwarded port — inherent to forwarding) and any
+  local user on those hosts who can read your 0600 token. The worst such a party
+  can do is make your Mac open a file *it* supplied, attributed to the nearest
+  enrolled host's label. It cannot escape the mirror, run commands, or
+  impersonate another host.
 
 ## Commands
 

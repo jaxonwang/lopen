@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 )
 
 // Host is one enrolled remote. Label doubles as the mirror subdirectory and
@@ -18,9 +17,15 @@ type Host struct {
 	Label string `json:"label"`
 	// Dest is the ssh destination ([user@]host, may be an ssh_config alias).
 	Dest string `json:"dest"`
-	// RemoteSocket is the socket path created on the remote host.
-	// Defaults to ".lopen/lopen.sock" (relative to the remote $HOME).
-	RemoteSocket string `json:"remote_socket,omitempty"`
+	// RemotePort is the loopback TCP port the daemon binds on the remote host
+	// (via ssh -R 127.0.0.1:<port>:<local unix socket>). Amazon-managed sshd
+	// refuses UNIX-socket reverse forwards (AllowStreamLocalForwarding), so the
+	// remote end of the tunnel is a loopback TCP port; access is gated by a
+	// per-host token in the 0600 remote agent config, not by socket file mode.
+	// Defaults to DefaultRemotePort. All hosts may share one port value — each
+	// binds on its own machine; the only collision is another local user on the
+	// same host, in which case set a distinct port here.
+	RemotePort int `json:"remote_port,omitempty"`
 	// Keep pins this host's mirror: GC never evicts it.
 	Keep bool `json:"keep,omitempty"`
 }
@@ -40,13 +45,18 @@ type Config struct {
 	// AllowInline permits inline payloads (needed for chained hosts the Mac
 	// cannot ssh to). Default true.
 	AllowInline *bool `json:"allow_inline,omitempty"`
+
+	// path is the file this config was loaded from (for Save). Not serialized.
+	path string `json:"-"`
 }
 
 const (
-	DefaultTTLDays       = 7
-	DefaultMaxMirror     = 2 << 30
-	DefaultMaxPayload    = 500 << 20
-	DefaultRemoteSocket  = ".lopen/lopen.sock"
+	DefaultTTLDays    = 7
+	DefaultMaxMirror  = 2 << 30
+	DefaultMaxPayload = 500 << 20
+	// DefaultRemotePort is the loopback TCP port bound on each remote host.
+	// Chosen in the IANA dynamic/private range to avoid well-known services.
+	DefaultRemotePort    = 47654
 	defaultConfigRelUnix = ".config/lopen/config.json"
 )
 
@@ -74,10 +84,70 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	c.path = path
 	if err := c.fill(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &c, nil
+}
+
+// LoadRaw reads a config without filling defaults, for editing (setup). A
+// missing file yields an empty config bound to path so a first enrollment can
+// create it.
+func LoadRaw(path string) (*Config, error) {
+	if path == "" {
+		path = DefaultPath()
+	}
+	c := &Config{path: path}
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return c, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(b, c); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	c.path = path
+	return c, nil
+}
+
+// Save writes the config back to the file it was loaded from, atomically.
+func (c *Config) Save() error {
+	if c.path == "" {
+		c.path = DefaultPath()
+	}
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
+}
+
+// AddHost appends a host after validating its label and destination are usable
+// and not already enrolled.
+func (c *Config) AddHost(h Host) error {
+	if !labelRe.MatchString(h.Label) {
+		return fmt.Errorf("invalid host label %q", h.Label)
+	}
+	if !ValidDest(h.Dest) {
+		return fmt.Errorf("invalid ssh destination %q", h.Dest)
+	}
+	for _, e := range c.Hosts {
+		if e.Label == h.Label {
+			return fmt.Errorf("host label %q already enrolled", h.Label)
+		}
+	}
+	c.Hosts = append(c.Hosts, h)
+	return nil
 }
 
 var labelRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
@@ -115,37 +185,14 @@ func (c *Config) fill() error {
 		if !ValidDest(h.Dest) {
 			return fmt.Errorf("host %q: invalid ssh destination %q", h.Label, h.Dest)
 		}
-		if h.RemoteSocket == "" {
-			h.RemoteSocket = DefaultRemoteSocket
+		if h.RemotePort == 0 {
+			h.RemotePort = DefaultRemotePort
 		}
-		if !validRemoteSocket(h.RemoteSocket) {
-			return fmt.Errorf("host %q: invalid remote_socket %q", h.Label, h.RemoteSocket)
+		if h.RemotePort < 1 || h.RemotePort > 65535 {
+			return fmt.Errorf("host %q: invalid remote_port %d", h.Label, h.RemotePort)
 		}
 	}
 	return nil
-}
-
-// validRemoteSocket accepts a relative path (bound under the remote $HOME by
-// ssh -R), rejecting anything that could break the `-R remote:local` spec
-// (a ':' splits the forward spec) or inject into the remote shell used for
-// pre-cleaning. Absolute paths, '..', and control/shell metacharacters are
-// disallowed.
-func validRemoteSocket(s string) bool {
-	if s == "" || strings.HasPrefix(s, "/") || strings.HasPrefix(s, "~") {
-		return false
-	}
-	if strings.Contains(s, "..") {
-		return false
-	}
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case r == '.' || r == '_' || r == '-' || r == '/':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 func (c *Config) InlineAllowed() bool {
@@ -164,6 +211,11 @@ func (c *Config) HostByLabel(label string) *Host {
 func (c *Config) SocketDir() string  { return filepath.Join(c.StateDir, "hosts") }
 func (c *Config) IndexPath() string  { return filepath.Join(c.StateDir, "index.json") }
 func (c *Config) ControlDir() string { return filepath.Join(c.StateDir, "ctl") }
+
+// TokensPath holds the persisted per-host auth tokens (0600). Tokens survive
+// daemon restarts so the remote agent config provisioned on each host stays
+// valid across reconnects.
+func (c *Config) TokensPath() string { return filepath.Join(c.StateDir, "tokens.json") }
 
 func defaultStateDir(home string) string {
 	if dirDarwin := filepath.Join(home, "Library", "Application Support"); isDir(dirDarwin) {

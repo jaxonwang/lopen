@@ -5,12 +5,14 @@ package client
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/jaxonwang/lopen/internal/protocol"
@@ -18,47 +20,75 @@ import (
 )
 
 type Options struct {
-	Socket  string // unix socket path; default ~/.lopen/lopen.sock
-	Label   string // origin label; default short hostname
+	Agent   string // path to the agent config; default ~/.lopen/agent.json
+	Addr    string // dial address override (host:port); default from agent config
+	Label   string // origin label override; default from agent config
+	Token   string // token override; default from agent config
 	Wait    bool
 	Force   bool
 	Reveal  bool
 	App     string
-	Retry   time.Duration // how long to retry a missing/refusing socket
+	Retry   time.Duration // how long to retry a missing/refusing endpoint
 	MaxSize int64         // refuse to send more than this many bytes
 	Stderr  io.Writer
 }
 
-func DefaultSocket() string {
+// DefaultAgentPath is the remote agent config the daemon provisions.
+func DefaultAgentPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".lopen", "lopen.sock")
+	return filepath.Join(home, ".lopen", "agent.json")
 }
 
-func DefaultLabel() string {
-	h, err := os.Hostname()
+// loadAgent reads the daemon-provisioned agent config.
+func loadAgent(path string) (*protocol.AgentConfig, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return "unknown"
-	}
-	// Short hostname; the full FQDN travels in Origin.Host.
-	for i := 0; i < len(h); i++ {
-		if h[i] == '.' {
-			return h[:i]
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf(
+				"no lopen agent config at %s\nThis host is not enrolled, or the tunnel from your Mac is not up.\nIf this is a chained hop, reconnect it with `lssh`; if it is a direct host, check `lopend` on your Mac", path)
 		}
+		return nil, err
 	}
-	return h
+	var a protocol.AgentConfig
+	if err := json.Unmarshal(b, &a); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if a.Label == "" || a.Token == "" {
+		return nil, fmt.Errorf("%s: incomplete agent config", path)
+	}
+	if a.Port < 1 || a.Port > 65535 {
+		return nil, fmt.Errorf("%s: invalid port %d in agent config", path, a.Port)
+	}
+	return &a, nil
 }
 
 // Open sends one path. Returns nil once the daemon reports the local open
 // succeeded (or, with Wait=false, once the daemon acknowledged receipt).
 func Open(path string, o Options) error {
-	if o.Socket == "" {
-		o.Socket = DefaultSocket()
-	}
-	if o.Label == "" {
-		o.Label = DefaultLabel()
+	// Resolve label/addr/token from the daemon-provisioned agent config unless
+	// explicitly overridden. Reading the config only when a value is missing
+	// lets tests inject everything directly.
+	if o.Label == "" || o.Addr == "" || o.Token == "" {
+		agentPath := o.Agent
+		if agentPath == "" {
+			agentPath = DefaultAgentPath()
+		}
+		a, err := loadAgent(agentPath)
+		if err != nil {
+			return err
+		}
+		if o.Label == "" {
+			o.Label = a.Label
+		}
+		if o.Addr == "" {
+			o.Addr = net.JoinHostPort("127.0.0.1", strconv.Itoa(a.Port))
+		}
+		if o.Token == "" {
+			o.Token = a.Token
+		}
 	}
 	if !protocol.ValidLabel(o.Label) {
-		return fmt.Errorf("hostname %q is not usable as a label; pass --label", o.Label)
+		return fmt.Errorf("label %q from agent config is invalid", o.Label)
 	}
 	if o.Stderr == nil {
 		o.Stderr = os.Stderr
@@ -92,7 +122,7 @@ func Open(path string, o Options) error {
 		return fmt.Errorf("%s is %d bytes (limit %d); re-run with --force", path, size, o.MaxSize)
 	}
 
-	conn, err := dialRetry(o.Socket, o.Retry)
+	conn, err := dialRetry(o.Addr, o.Retry)
 	if err != nil {
 		return err
 	}
@@ -114,6 +144,7 @@ func Open(path string, o Options) error {
 		App:    o.App,
 		Size:   size,
 		Mode:   protocol.ModeInline,
+		Token:  o.Token,
 	}
 	if err := protocol.WriteRequest(conn, req); err != nil {
 		return err
@@ -180,14 +211,14 @@ func doneToErr(ev *protocol.Event) error {
 
 // dialRetry retries for the configured window: right after laptop wake the
 // tunnel needs a few seconds to re-establish.
-func dialRetry(sock string, window time.Duration) (net.Conn, error) {
+func dialRetry(addr string, window time.Duration) (net.Conn, error) {
 	if window == 0 {
 		window = 10 * time.Second
 	}
 	deadline := time.Now().Add(window)
 	var lastErr error
 	for {
-		conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err == nil {
 			return conn, nil
 		}
@@ -198,7 +229,7 @@ func dialRetry(sock string, window time.Duration) (net.Conn, error) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return nil, fmt.Errorf(
-		"no lopen socket at %s (%v)\nIf this is a chained hop, reconnect it with `lssh`; if it is a direct host, check `lopend` on your Mac", sock, lastErr)
+		"cannot reach lopen daemon at %s (%v)\nThe reverse tunnel from your Mac may be down.\nIf this is a chained hop, reconnect it with `lssh`; if it is a direct host, check `lopend` on your Mac", addr, lastErr)
 }
 
 func dirSize(root string) (int64, error) {

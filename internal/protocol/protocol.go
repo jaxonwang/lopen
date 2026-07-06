@@ -73,6 +73,24 @@ type Request struct {
 	App   string `json:"app,omitempty"`
 	Size  int64  `json:"size"` // declared payload size; advisory, re-checked on receive
 	Mode  string `json:"mode"`
+	// Token authenticates the request. The remote transport is a loopback TCP
+	// port reachable by any local user on the remote host (unlike a 0600 UNIX
+	// socket), so the daemon requires a per-host secret that only a client able
+	// to read the 0600 remote agent config can supply. Compared in constant
+	// time against the daemon's stored token for the tunnel's host.
+	Token string `json:"token,omitempty"`
+}
+
+// AgentConfig is the small file the daemon provisions on each remote host
+// (~/.lopen/agent.json, mode 0600). The remote `lopen` client reads it to learn
+// the label the daemon knows this host by, the loopback port to dial, and the
+// token to authenticate with. Because the transport is a shared-loopback TCP
+// port rather than a per-user socket, the 0600 mode on this file is what keeps
+// another local user from learning the token and pushing files as you.
+type AgentConfig struct {
+	Label string `json:"label"`
+	Port  int    `json:"port"`
+	Token string `json:"token"`
 }
 
 // Event is a daemon → client message.
