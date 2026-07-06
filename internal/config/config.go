@@ -45,6 +45,9 @@ type Config struct {
 	// AllowInline permits inline payloads (needed for chained hosts the Mac
 	// cannot ssh to). Default true.
 	AllowInline *bool `json:"allow_inline,omitempty"`
+
+	// path is the file this config was loaded from (for Save). Not serialized.
+	path string `json:"-"`
 }
 
 const (
@@ -81,10 +84,70 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	c.path = path
 	if err := c.fill(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &c, nil
+}
+
+// LoadRaw reads a config without filling defaults, for editing (setup). A
+// missing file yields an empty config bound to path so a first enrollment can
+// create it.
+func LoadRaw(path string) (*Config, error) {
+	if path == "" {
+		path = DefaultPath()
+	}
+	c := &Config{path: path}
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return c, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(b, c); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	c.path = path
+	return c, nil
+}
+
+// Save writes the config back to the file it was loaded from, atomically.
+func (c *Config) Save() error {
+	if c.path == "" {
+		c.path = DefaultPath()
+	}
+	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
+}
+
+// AddHost appends a host after validating its label and destination are usable
+// and not already enrolled.
+func (c *Config) AddHost(h Host) error {
+	if !labelRe.MatchString(h.Label) {
+		return fmt.Errorf("invalid host label %q", h.Label)
+	}
+	if !ValidDest(h.Dest) {
+		return fmt.Errorf("invalid ssh destination %q", h.Dest)
+	}
+	for _, e := range c.Hosts {
+		if e.Label == h.Label {
+			return fmt.Errorf("host label %q already enrolled", h.Label)
+		}
+	}
+	c.Hosts = append(c.Hosts, h)
+	return nil
 }
 
 var labelRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`)
