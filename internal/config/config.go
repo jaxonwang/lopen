@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 )
 
 // Host is one enrolled remote. Label doubles as the mirror subdirectory and
@@ -35,8 +36,9 @@ type Config struct {
 
 	// MirrorDir is where fetched files land. Default ~/lopen.
 	MirrorDir string `json:"mirror_dir,omitempty"`
-	// StateDir holds sockets, index, logs. Default:
-	// darwin ~/Library/Application Support/lopen, else ~/.local/state/lopen.
+	// StateDir holds sockets, index, logs. Default: darwin ~/Library/
+	// Application Support/lopen, windows %LOCALAPPDATA%\lopen, else
+	// $XDG_STATE_HOME/lopen or ~/.local/state/lopen.
 	StateDir string `json:"state_dir,omitempty"`
 
 	TTLDays         int   `json:"ttl_days,omitempty"`          // default 7
@@ -218,8 +220,17 @@ func (c *Config) ControlDir() string { return filepath.Join(c.StateDir, "ctl") }
 func (c *Config) TokensPath() string { return filepath.Join(c.StateDir, "tokens.json") }
 
 func defaultStateDir(home string) string {
+	if runtime.GOOS == "windows" {
+		if d := os.Getenv("LOCALAPPDATA"); d != "" {
+			return filepath.Join(d, "lopen")
+		}
+		return filepath.Join(home, "AppData", "Local", "lopen")
+	}
 	if dirDarwin := filepath.Join(home, "Library", "Application Support"); isDir(dirDarwin) {
 		return filepath.Join(dirDarwin, "lopen")
+	}
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
+		return filepath.Join(d, "lopen")
 	}
 	return filepath.Join(home, ".local", "state", "lopen")
 }

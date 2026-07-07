@@ -12,7 +12,6 @@ package mirror
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -31,6 +30,8 @@ var ErrLocallyModified = errors.New("local copy has unsaved modifications (re-ru
 // Rel computes the mirror-relative key for a request path, confined under
 // the label directory. remotePath must be absolute and pre-validated by the
 // protocol layer; SafeJoin re-checks confinement as defense in depth.
+// Keys are always slash-separated (the remote is POSIX and the index's
+// prefix logic assumes '/'), regardless of the local OS.
 func Rel(label, remotePath string) (string, error) {
 	p, err := tarstream.SafeJoin(label, strings.TrimPrefix(remotePath, "/"))
 	if err != nil {
@@ -39,10 +40,10 @@ func Rel(label, remotePath string) (string, error) {
 	if p == label { // remotePath was "/" or cleaned away entirely
 		return "", errors.New("refusing to mirror filesystem root")
 	}
-	return p, nil
+	return filepath.ToSlash(p), nil
 }
 
-func (m *Mirror) Abs(rel string) string { return filepath.Join(m.Root, rel) }
+func (m *Mirror) Abs(rel string) string { return filepath.Join(m.Root, filepath.FromSlash(rel)) }
 
 // CheckOverwrite enforces the locally-modified guard before a sync replaces
 // an existing mirror slot. Promote replaces the entire subtree rooted at
@@ -177,7 +178,7 @@ func (m *Mirror) GC(ttl time.Duration, maxBytes int64, pinned map[string]bool) G
 		if !expired && !overCap {
 			continue
 		}
-		label := strings.SplitN(e.Rel, string(filepath.Separator), 2)[0]
+		label := strings.SplitN(e.Rel, "/", 2)[0]
 		if pinned[label] {
 			continue
 		}
@@ -203,14 +204,6 @@ func (m *Mirror) GC(ttl time.Duration, maxBytes int64, pinned map[string]bool) G
 	}
 	m.pruneEmptyDirs()
 	return res
-}
-
-// fileInUse best-effort checks whether any process has the path open.
-// Deleting an open file on macOS does not crash the reader (the inode
-// persists), so a false negative here is cosmetic, not a correctness issue.
-func fileInUse(abs string) bool {
-	out, err := exec.Command("lsof", "-t", "--", abs).Output()
-	return err == nil && len(strings.TrimSpace(string(out))) > 0
 }
 
 func (m *Mirror) pruneEmptyDirs() {

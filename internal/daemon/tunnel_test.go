@@ -1,3 +1,5 @@
+//go:build unix
+
 package daemon
 
 import (
@@ -12,11 +14,11 @@ import (
 // broke the ssh `-o ControlPath=...` argument: ssh parses the option value like
 // a config line and splits on whitespace unless the value is double-quoted,
 // failing with "keyword controlpath extra arguments at end of line" and
-// flapping the tunnel.
+// flapping the tunnel. Multiplexing (and thus ControlPath) is unix-only.
 func TestControlPathOptQuotedForSpaces(t *testing.T) {
 	tun := &Tunnel{Host: config.Host{Label: "devbox"}}
 	ctlDir := "/Users/me/Library/Application Support/lopen/ctl"
-	opt := tun.controlPathOpt(ctlDir)
+	opt := controlPathOpt(ctlDir, tun.Host.Label)
 
 	if !strings.HasPrefix(opt, `ControlPath="`) || !strings.HasSuffix(opt, `"`) {
 		t.Fatalf("ControlPath value not double-quoted: %s", opt)

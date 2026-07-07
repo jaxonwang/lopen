@@ -1,11 +1,11 @@
 # lopen
 
-Open a **remote** file or directory on your **local Mac** — from any ssh
-session — with a single command:
+Open a **remote** file or directory on your **local machine** (macOS, Linux,
+or Windows) — from any ssh session — with a single command:
 
 ```sh
 $ lopen report.pdf      # on the remote host
-# ...report.pdf opens in Preview on your Mac.
+# ...report.pdf opens in your local default viewer.
 ```
 
 `lopen` blocks until the file has actually opened locally, so it behaves like
@@ -15,7 +15,7 @@ because the mechanism never touches your interactive terminal session.
 
 ## Why it works everywhere (including mosh)
 
-Most "open on my Mac from ssh" tools ride the terminal: they emit a terminal
+Most "open locally from ssh" tools ride the terminal: they emit a terminal
 escape sequence (OSC 52 / iTerm2 OSC 1337 / kitty transfer) that a local
 terminal or daemon intercepts. That breaks under **mosh**, which is not a byte
 pipe — it runs a server-side terminal emulator and synchronizes *screen
@@ -26,19 +26,19 @@ under per-session reverse tunnels, because mosh has no port forwarding at all.
 session**:
 
 ```
-┌─ your Mac ─────────────────────────────┐        ┌─ dev host ────────────────┐
-│ lopend (launchd agent, always running) │        │                           │
+┌─ your machine ─────────────────────────┐        ┌─ dev host ────────────────┐
+│ lopend (autostart agent, always up)    │        │                           │
 │  • holds a persistent ssh -N -R reverse│  ssh   │  127.0.0.1:47654           │
 │    TCP-to-local-socket tunnel per host ─┼────────┼─►  (bound by sshd)         │
 │  • listens on a per-host local socket  │        │  ~/.lopen/agent.json 0600  │
 │  • receives the file bytes inline      │◄───────┼── lopen report.pdf         │
 │  • writes ~/lopen/<host>/<path>        │        │    (sends request + bytes) │
-│  • runs `open`, replies "opened" ──────┼────────┼─►  (unblocks)              │
+│  • opens it locally, replies "opened" ─┼────────┼─►  (unblocks)              │
 └─────────────────────────────────────────┘        └───────────────────────────┘
 ```
 
-Your Mac dials out and holds the tunnel; the remote never has to reach back to
-your laptop (which corp VPN/NAT usually forbids anyway). Because the tunnel is
+Your machine dials out and holds the tunnel; the remote never has to reach
+back to your laptop (which corp VPN/NAT usually forbids anyway). Because the tunnel is
 a separate connection from your mosh/tmux session, mosh on the first hop is
 fully supported.
 
@@ -51,23 +51,23 @@ own local socket. A loopback port is reachable by *any local user* on that
 host, so access is gated by a per-host **token**: the daemon provisions
 `~/.lopen/agent.json` (mode 0600, holding `{label, port, token}`) over the ssh
 connection it already holds, and `lopen` must present that token. Only a process
-that can read your 0600 file can push to your Mac.
+that can read your 0600 file can push to your machine.
 
 **Transfer is inline over ssh.** `lopen` streams the file's bytes back through
 the forwarded port, so the daemon never needs to `scp`/`rsync` *back* to the
-host — it only needs the connection the Mac already opened. That's what makes
+host — it only needs the connection your machine already opened. That's what makes
 chained hops into unreachable private networks work.
 
 ## Recursive / chained ssh (private networks, no ProxyJump)
 
-For `Mac → A → B → C` where C is only reachable from B, extend the tunnel one
+For `laptop → A → B → C` where C is only reachable from B, extend the tunnel one
 hop at a time with the bundled `lssh` wrapper instead of `ssh` for inner hops:
 
 ```sh
-# on your Mac: lopend already tunnels to A
+# on your laptop: lopend already tunnels to A
 lssh B      # from A — forwards the port to B, copies the agent config
 lssh C      # from B — forwards it to C
-lopen file  # on C — relays C→B→A→Mac; opens on your Mac
+lopen file  # on C — relays C→B→A→laptop; opens locally
 ```
 
 `lssh` is `ssh` plus `-R 127.0.0.1:<port>:127.0.0.1:<port>` (the port it reads
@@ -80,22 +80,34 @@ the common case.)
 ## Install
 
 ```sh
-# On your Mac:
-make darwin                 # builds dist/lopend-darwin-{arm64,amd64}
-cp dist/lopend-darwin-$(uname -m | sed s/x86_64/amd64/) ~/bin/lopend
+# On your local machine:
+make darwin    # or `make linux` / `make windows` — builds dist/lopend-<os>-<arch>
+cp dist/lopend-<os>-<arch> ~/bin/lopend        # (or %USERPROFILE%\\bin on Windows)
 
-# Create ~/.config/lopen/config.json (see Configuration), then:
-lopend install              # writes + loads the launchd agent, excludes the
-                            # mirror from Time Machine, chmods it 0700
+# Enroll a host and create ~/.config/lopen/config.json:
+lopend setup <ssh-host>
 ```
 
+Keeping `lopend` running at login is per-platform:
+
+- **macOS:** `lopend install` writes and loads a launchd agent (and excludes
+  the mirror from Time Machine). Homebrew users use `brew services` instead.
+- **Linux:** a systemd user unit — `~/.config/systemd/user/lopend.service`
+  with `ExecStart=%h/bin/lopend`, `WantedBy=default.target`,
+  `Restart=on-failure` — then `systemctl --user enable --now lopend`. Run
+  `loginctl enable-linger` to keep it alive without an open session (opens
+  still need a graphical session to land).
+- **Windows:** a shortcut to `lopend.exe` in the Startup folder
+  (`shell:startup`) or an `HKCU\...\Run` registry entry — neither needs
+  admin.
+
 The remote `lopen` binary and `lssh` are pushed to each host by
-`lopen setup <host>` (from your Mac); remote hosts need nothing preinstalled.
-Everything is userland — **no admin/root on either side**.
+`lopend setup <host>` (from your local machine); remote hosts need nothing
+preinstalled. Everything is userland — **no admin/root on either side**.
 
 ## Configuration
 
-`~/.config/lopen/config.json` on the Mac:
+`~/.config/lopen/config.json` on the local machine:
 
 ```json
 {
@@ -131,7 +143,8 @@ cache**:
 - **Size cap:** if the mirror exceeds 2 GiB, least-recently-used entries are
   evicted until under the cap.
 - GC runs at daemon start and once a day; empty directories are pruned.
-- Excluded from Time Machine at install and `chmod 0700`.
+- Kept `chmod 0700`; on macOS `lopend install` also excludes it from Time
+  Machine.
 
 ### Overwrite semantics (opening the same path with a new version)
 
@@ -148,8 +161,11 @@ rsync's default), not a security mechanism; `--force` always overrides.
 
 ## Security model
 
-- **On your Mac, no network listeners** — the daemon accepts only on per-host
-  UNIX sockets, mode 0600 inside 0700 directories.
+- **On your machine, no network listeners** — the daemon accepts only on a
+  per-host local endpoint: a UNIX socket (mode 0600 inside a 0700 directory)
+  on macOS/Linux, or an ephemeral **loopback** TCP port on Windows, whose
+  bundled ssh.exe cannot forward to a local UNIX socket. Either way the
+  per-host token below — not the socket mode — is the real gate.
 - **On the remote, a loopback-only TCP port** (`127.0.0.1:<port>`, never
   `0.0.0.0`) bridged to that socket by sshd. Because any local user on the
   remote can connect to a loopback port, every request must carry a **per-host
@@ -172,28 +188,38 @@ rsync's default), not a security mechanism; `--force` always overrides.
 - **Trust statement:** you are trusting the chain of hosts you ssh through
   (each can read/inject on the forwarded port — inherent to forwarding) and any
   local user on those hosts who can read your 0600 token. The worst such a party
-  can do is make your Mac open a file *it* supplied, attributed to the nearest
-  enrolled host's label. It cannot escape the mirror, run commands, or
+  can do is make your machine open a file *it* supplied, attributed to the
+  nearest enrolled host's label. It cannot escape the mirror, run commands, or
   impersonate another host.
 
 ## Commands
 
 | Command | Where | What |
 |---|---|---|
-| `lopen <path>` | remote | open a file/dir on your Mac (blocks) |
+| `lopen <path>` | remote | open a file/dir on your local machine (blocks) |
 | `lopen -n <path>` | remote | fire and forget |
-| `lopen -reveal <path>` | remote | reveal in Finder instead of opening |
-| `lopen -a <App> <path>` | remote | open with a specific app |
+| `lopen -reveal <path>` | remote | reveal in Finder / file manager / Explorer |
+| `lopen -a <App> <path>` | remote | open with a specific app (macOS local side only) |
 | `lssh <ssh args>` | remote | ssh one hop deeper, extending the socket chain |
-| `lopend install` | Mac | install/refresh the launchd agent |
-| `lopen setup <host>` | Mac | enroll a host (push binary + config) |
+| `lopend setup <host>` | local | enroll a host (push binary + config) |
+| `lopend install` | local (macOS) | install/refresh the launchd agent |
 
 ## Requirements
 
-- **Mac:** macOS with `ssh`, `open` (built in). No admin. Go only to build.
-- **Remote:** any Linux/Unix with `ssh` and (for pull mode) `tar`/`cat`. The
-  `lopen` binary is self-contained and pushed by `lopen setup`.
-- **Connectivity:** passwordless ssh from your Mac to each enrolled host.
+Local side (any one of):
+
+- **macOS:** `ssh` and `open` (built in). No admin.
+- **Linux:** OpenSSH client, plus `gio` (glib2) or `xdg-open` (xdg-utils) to
+  open, and `gdbus` for `-reveal`. Opens need a graphical session. No root.
+- **Windows 10/11:** the bundled OpenSSH client (`ssh.exe`). Opens go through
+  the shell's default handler; `-reveal` uses Explorer. No admin. Note:
+  Windows ssh.exe has no ControlMaster, so pull-mode transfers pay a full
+  ssh handshake per request (inline mode, the default, is unaffected).
+
+Remote side: any Linux/Unix with `sshd` and (for pull mode) `tar`/`cat`. The
+`lopen` binary is self-contained and pushed by `lopend setup`.
+
+Connectivity: passwordless ssh from your local machine to each enrolled host.
 
 ## License
 

@@ -9,9 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -32,7 +30,7 @@ type Server struct {
 	tunnels map[string]*Tunnel
 	tokens  *tokenStore
 
-	// OpenCommand overrides /usr/bin/open (tests / linux dev).
+	// OpenCommand overrides the platform opener (tests).
 	OpenCommand string
 
 	// requestTimeout bounds one whole request (header, payload, open).
@@ -132,8 +130,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	var bounds []bound
 	for _, h := range s.Cfg.Hosts {
-		sock := filepath.Join(s.Cfg.SocketDir(), h.Label+".sock")
-		ln, err := listenUnix(sock)
+		ln, fwd, err := listenLocal(s.Cfg, h.Label)
 		if err != nil {
 			return fmt.Errorf("host %s: %w", h.Label, err)
 		}
@@ -141,7 +138,7 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("host %s: %w", h.Label, err)
 		}
-		t := &Tunnel{Host: h, LocalSock: sock, Token: token, Log: s.Log}
+		t := &Tunnel{Host: h, LocalSock: fwd, Token: token, Log: s.Log}
 		s.tunnels[h.Label] = t
 		bounds = append(bounds, bound{t: t, ln: ln})
 	}
@@ -178,15 +175,6 @@ func (s *Server) Run(ctx context.Context) error {
 	<-ctx.Done()
 	wg.Wait()
 	return nil
-}
-
-func listenUnix(path string) (net.Listener, error) {
-	_ = os.Remove(path)
-	// Restrictive umask on the socket: only this user may connect locally.
-	old := umask(0o077)
-	ln, err := net.Listen("unix", path)
-	umask(old)
-	return ln, err
 }
 
 func (s *Server) runGC() {
@@ -396,28 +384,4 @@ func (s *Server) pull(ctx context.Context, t *Tunnel, req *protocol.Request, sta
 		return protocol.ErrPayloadTooLarge
 	}
 	return waitErr
-}
-
-// open runs the macOS opener on the mirrored path. abs is daemon-constructed
-// (mirror root + validated rel); req.App passed appRe. Everything is argv,
-// never a shell.
-func (s *Server) open(ctx context.Context, req *protocol.Request, abs string) error {
-	bin := s.OpenCommand
-	if bin == "" {
-		bin = "/usr/bin/open"
-	}
-	args := []string{}
-	if req.Op == protocol.OpReveal {
-		args = append(args, "-R")
-	}
-	if req.App != "" {
-		args = append(args, "-a", req.App)
-	}
-	args = append(args, "--", abs)
-	cmd := exec.CommandContext(ctx, bin, args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("open failed: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }

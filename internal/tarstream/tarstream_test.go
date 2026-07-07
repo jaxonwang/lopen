@@ -134,9 +134,9 @@ func TestUnpackEntryCap(t *testing.T) {
 
 func TestSafeJoin(t *testing.T) {
 	good := map[string]string{
-		"a/b.txt":  "/root/a/b.txt",
-		"a/./b":    "/root/a/b",
-		"a/c/../b": "/root/a/b",
+		"a/b.txt":  filepath.FromSlash("/root/a/b.txt"),
+		"a/./b":    filepath.FromSlash("/root/a/b"),
+		"a/c/../b": filepath.FromSlash("/root/a/b"),
 	}
 	for name, want := range good {
 		got, err := SafeJoin("/root", name)
@@ -144,7 +144,11 @@ func TestSafeJoin(t *testing.T) {
 			t.Errorf("SafeJoin(%q) = %q, %v; want %q", name, got, err, want)
 		}
 	}
-	for _, name := range []string{"", "/abs", "../x", "a/../../x", "..", "a\x00"} {
+	// Confinement is checked in slash space regardless of host OS. Backslash
+	// is rejected so a `..\..\x` name cannot escape root on Windows, where
+	// filepath treats '\' as a separator.
+	for _, name := range []string{"", "/abs", "../x", "a/../../x", "..", "a\x00",
+		`..\..\x`, `a\b`, `\abs`} {
 		if _, err := SafeJoin("/root", name); err == nil {
 			t.Errorf("SafeJoin(%q): expected error", name)
 		}

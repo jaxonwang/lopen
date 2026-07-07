@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -152,6 +153,13 @@ func Unpack(r io.Reader, dest string, maxBytes int64, maxEntries int) (skipped i
 // escapes root. The result is lexically confined; callers must ensure root
 // itself contains no attacker-controlled symlinks (Unpack guarantees this by
 // never creating symlinks).
+//
+// name is always a POSIX path (a remote absolute path or a tar entry name),
+// so confinement is checked in slash space. A literal backslash is rejected
+// rather than treated as data: on Windows filepath.Clean/Join treat '\' as a
+// separator, so an unrejected `..\..\x` would escape root there even though
+// the '../' check passes. Backslash in a POSIX filename is legal but vanishing
+// -ly rare, and refusing it is the safe default for this confinement boundary.
 func SafeJoin(root, name string) (string, error) {
 	if name == "" {
 		return "", errors.New("empty name")
@@ -159,12 +167,15 @@ func SafeJoin(root, name string) (string, error) {
 	if strings.ContainsRune(name, 0) {
 		return "", errors.New("NUL in name")
 	}
-	if filepath.IsAbs(name) {
+	if strings.ContainsRune(name, '\\') {
+		return "", errors.New("backslash in name")
+	}
+	if path.IsAbs(name) {
 		return "", errors.New("absolute path")
 	}
-	clean := filepath.Clean(name)
+	clean := path.Clean(name)
 	if clean == ".." || strings.HasPrefix(clean, "../") {
 		return "", errors.New("path escapes root")
 	}
-	return filepath.Join(root, clean), nil
+	return filepath.Join(root, filepath.FromSlash(clean)), nil
 }

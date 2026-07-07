@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 
 	"github.com/jaxonwang/lopen/internal/config"
@@ -45,22 +44,6 @@ func (t *Tunnel) ssh() string {
 	return "ssh"
 }
 
-// controlPath returns the ControlMaster socket path for this host. Kept
-// short: unix socket paths have a ~104-byte limit on macOS.
-func (t *Tunnel) controlPath(ctlDir string) string {
-	return filepath.Join(ctlDir, t.Host.Label+".ctl")
-}
-
-// controlPathOpt formats the ControlPath option value. ssh parses a `-o
-// key=value` argument like a config-file line and splits value on whitespace,
-// so a path containing a space (the default macOS state dir lives under
-// "~/Library/Application Support") must be double-quoted or ssh errors with
-// "keyword controlpath extra arguments at end of line". The path cannot
-// itself contain a double quote: it is derived from ctlDir + a validated label.
-func (t *Tunnel) controlPathOpt(ctlDir string) string {
-	return `ControlPath="` + t.controlPath(ctlDir) + `"`
-}
-
 // connArgs are the safety-critical ssh options common to every connection.
 // Host.Dest is validated against destRe at config load, and "--" precedes it
 // everywhere, so it can never be parsed as an option.
@@ -72,29 +55,20 @@ func (t *Tunnel) connArgs() []string {
 	}
 }
 
-// masterArgs make this connection the ControlMaster: the persistent tunnel
-// (ssh -N -R) forces ControlMaster=yes and holds the connection open in the
-// foreground, so pull-mode Exec can multiplex over it via the same ControlPath.
-//
-// ControlPersist is deliberately NOT set: with it, ssh backgrounds the master
-// and the foreground -N returns immediately (nil error), which the supervisor
-// misreads as the tunnel dying — an endless up/down flap while a detached
-// master silently holds the forward. Without persist, the foreground -N blocks
-// for the life of the connection, and when it dies the master dies with it.
+// masterArgs make this connection the ControlMaster where the platform's ssh
+// supports multiplexing: the persistent tunnel (ssh -N -R) holds the
+// connection open in the foreground, so pull-mode Exec can multiplex over it
+// via the same ControlPath. On Windows (no ControlMaster) it is just
+// connArgs, and each Exec opens its own connection.
 func (t *Tunnel) masterArgs(ctlDir string) []string {
-	return append(t.connArgs(),
-		"-o", "ControlMaster=yes",
-		"-o", t.controlPathOpt(ctlDir),
-	)
+	return append(t.connArgs(), masterMuxArgs(ctlDir, t.Host.Label)...)
 }
 
 // clientArgs multiplex a short-lived command over the tunnel's master if it is
-// up, without ever promoting themselves to master (ControlMaster=no).
+// up, without ever promoting themselves to master. On Windows they are just
+// connArgs (a standalone connection).
 func (t *Tunnel) clientArgs(ctlDir string) []string {
-	return append(t.connArgs(),
-		"-o", "ControlMaster=no",
-		"-o", t.controlPathOpt(ctlDir),
-	)
+	return append(t.connArgs(), clientMuxArgs(ctlDir, t.Host.Label)...)
 }
 
 func (t *Tunnel) Run(ctx context.Context, ctlDir string) {
