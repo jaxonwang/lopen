@@ -219,6 +219,10 @@ func (c *Config) ControlDir() string { return filepath.Join(c.StateDir, "ctl") }
 // valid across reconnects.
 func (c *Config) TokensPath() string { return filepath.Join(c.StateDir, "tokens.json") }
 
+// LockPath is the single-instance advisory lock file: only one lopend may run
+// per state dir, so a second daemon can't clobber the running one's sockets.
+func (c *Config) LockPath() string { return filepath.Join(c.StateDir, "lopend.lock") }
+
 func defaultStateDir(home string) string {
 	if runtime.GOOS == "windows" {
 		if d := os.Getenv("LOCALAPPDATA"); d != "" {

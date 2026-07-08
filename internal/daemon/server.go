@@ -121,6 +121,16 @@ const maxArchiveEntries = 200_000
 func (s *Server) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 
+	// Single-instance guard: acquire before any listenLocal. If another lopend
+	// is already running, exit fast rather than os.Remove its live request
+	// sockets out from under it (which would orphan the running daemon's
+	// listener fd and break every open with "connection reset").
+	lock, err := acquireLock(s.Cfg.LockPath())
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+
 	// Build every tunnel and listener up front so s.tunnels is fully
 	// populated before any accept loop starts — the map is then read-only
 	// for the daemon's lifetime and needs no lock.
