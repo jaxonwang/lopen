@@ -3,8 +3,10 @@
 package daemon
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jaxonwang/lopen/internal/config"
 )
@@ -41,6 +43,50 @@ func TestControlPathOptQuotedForSpaces(t *testing.T) {
 	}
 	if cp(master) != opt {
 		t.Fatalf("masterArgs ControlPath %q != controlPathOpt %q", cp(master), opt)
+	}
+}
+
+// TestProvisionTimesOutOnHungSSH guards against the hang that wedged the daemon
+// for days: provision runs synchronously at the top of every tunnel attempt, so
+// if its ssh blocks (network gone after laptop sleep/wake), an unbounded
+// provision stops the retry loop from ever bringing the tunnel up. The
+// provisionTimeout ceiling must bound a genuinely-hung ssh under a LIVE context
+// (not merely honor an already-cancelled one).
+//
+// `cat` with no closed stdin blocks forever, standing in for a hung ssh
+// connection; the injected short ceiling must kill it and return an error well
+// before the test's own deadline.
+func TestProvisionTimesOutOnHungSSH(t *testing.T) {
+	tun := &Tunnel{
+		Host:                     config.Host{Label: "devbox", Dest: "example.com", RemotePort: 47654},
+		SSHCommand:               "cat",
+		provisionTimeoutOverride: 500 * time.Millisecond,
+	}
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- tun.provision(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a timeout error from the hung provision")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("provision took %v — the timeout ceiling did not bound the hung ssh", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("provision did not return — a hung ssh can wedge the retry loop")
+	}
+}
+
+// TestConnArgsHasConnectTimeout locks in the ConnectTimeout safety option:
+// without it a stalled connect after sleep/wake hangs instead of failing fast.
+func TestConnArgsHasConnectTimeout(t *testing.T) {
+	tun := &Tunnel{Host: config.Host{Label: "devbox"}}
+	args := strings.Join(tun.connArgs(), " ")
+	if !strings.Contains(args, "ConnectTimeout=") {
+		t.Fatalf("connArgs missing ConnectTimeout: %s", args)
 	}
 }
 

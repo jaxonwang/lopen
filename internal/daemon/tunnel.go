@@ -35,6 +35,9 @@ type Tunnel struct {
 
 	// SSHCommand overrides the ssh binary (tests).
 	SSHCommand string
+	// provisionTimeoutOverride overrides provisionTimeout (tests). Zero uses
+	// the package default.
+	provisionTimeoutOverride time.Duration
 }
 
 func (t *Tunnel) ssh() string {
@@ -47,13 +50,26 @@ func (t *Tunnel) ssh() string {
 // connArgs are the safety-critical ssh options common to every connection.
 // Host.Dest is validated against destRe at config load, and "--" precedes it
 // everywhere, so it can never be parsed as an option.
+//
+// ConnectTimeout bounds connection *setup* (ServerAliveInterval only bounds an
+// already-established session), so a stalled connect after a laptop sleep/wake
+// or network change fails fast and retries instead of hanging.
 func (t *Tunnel) connArgs() []string {
 	return []string{
 		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=15",
 		"-o", "ServerAliveInterval=30",
 		"-o", "ServerAliveCountMax=3",
 	}
 }
+
+// provisionTimeout is a hard ceiling on one provisioning attempt. provision
+// runs synchronously at the top of each tunnel attempt, so if its ssh ever
+// hangs (a half-open TCP that ConnectTimeout/keepalives somehow don't catch),
+// an unbounded provision would block the retry loop forever — the daemon looks
+// up while the tunnel is dead. This deadline guarantees the loop always makes
+// progress.
+const provisionTimeout = 45 * time.Second
 
 // masterArgs make this connection the ControlMaster where the platform's ssh
 // supports multiplexing: the persistent tunnel (ssh -N -R) holds the
@@ -132,6 +148,14 @@ func (t *Tunnel) once(ctx context.Context, ctlDir string) error {
 // provision would create the master and cause the tunnel's -N to return
 // immediately, flapping the tunnel.
 func (t *Tunnel) provision(ctx context.Context) error {
+	// Hard ceiling so a hung ssh can never wedge the retry loop.
+	timeout := provisionTimeout
+	if t.provisionTimeoutOverride > 0 {
+		timeout = t.provisionTimeoutOverride
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	agent := protocol.AgentConfig{Label: t.Host.Label, Port: t.Host.RemotePort, Token: t.Token}
 	blob, err := json.Marshal(agent)
 	if err != nil {
