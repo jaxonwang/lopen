@@ -2,7 +2,7 @@ class Lopen < Formula
   desc "Open remote files and directories on your local Mac from an SSH session"
   homepage "https://github.com/jaxonwang/lopen"
   url "https://github.com/jaxonwang/lopen/archive/refs/tags/v0.3.2.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "02c7a78c276adf8ba3fdc6cec691f09ddc0e4afba817b87c814ee17d354c745f"
   license "MIT"
 
   depends_on "go" => :build
